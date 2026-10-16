@@ -1,0 +1,15 @@
+[package]
+# MacNeutron's stand-in for rutabaga_gfx (patched in through the workspace's [patch.crates-io]): the API subset
+# libkrun's virtio-gpu device uses, with one context type, dxmt (capset 63), whose commands and fences go to callbacks
+# the VM host registers. No virglrenderer.
+name = "rutabaga_gfx"
+version = "0.1.85"
+edition = "2021"
+license = "Apache-2.0"
+
+[features]
+virgl_renderer = []
+
+[dependencies]
+libc = "0.2"
+log = "0.4"

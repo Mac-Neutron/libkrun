@@ -14,6 +14,7 @@ members = [
     "src/arch",
     "src/hvf",
     "src/devices",
+    "src/rutabaga_dxmt",
     "src/aws_nitro",
     "src/whp",
     "bindings/libkrun-via-cdylib-weak",
@@ -24,6 +25,10 @@ exclude = [
     "init/aws-nitro",
 ]
 resolver = "2"
+
+# MacNeutron: libkrun's gpu device on the dxmt stand-in instead of rutabaga_gfx and virglrenderer.
+[patch.crates-io]
+rutabaga_gfx = { path = "src/rutabaga_dxmt" }
 #panic = "abort"
 
 [profile.release]

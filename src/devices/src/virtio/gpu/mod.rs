@@ -7,6 +7,7 @@ use super::descriptor_utils::Error as DescriptorError;
 
 pub use self::defs::uapi::VIRTIO_ID_GPU as TYPE_GPU;
 pub use self::device::Gpu;
+pub use self::virtio_gpu::VIRGLRENDERER_NO_VIRGL;
 
 mod defs {
     pub const GPU_DEV_ID: &str = "virtio_gpu";

@@ -251,6 +251,7 @@ impl VirtioDevice for Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::VIRGLRENDERER_NO_VIRGL;
     use crate::display::NoopDisplayBackend;
     use krun_display::IntoDisplayBackend;
 
@@ -272,5 +273,20 @@ mod tests {
         gpu.read_config(16, &mut data);
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
         assert_eq!(u32::from_le_bytes(data), page_size);
+    }
+
+    #[test]
+    fn no_virgl_offers_one_capset() {
+        let gpu = Gpu::new(
+            VIRGLRENDERER_NO_VIRGL,
+            Box::new([]),
+            NoopDisplayBackend::into_display_backend(None),
+            #[cfg(target_os = "macos")]
+            crossbeam_channel::unbounded().0,
+        )
+        .unwrap();
+        let mut data = [0u8; 4];
+        gpu.read_config(12, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 1);
     }
 }

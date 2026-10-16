@@ -27,6 +27,12 @@ use crate::vmm::builder::{attach_mmio_device, setup_terminal_raw_mode};
 use crate::vmm::device_manager::shm::ShmManager;
 #[cfg(any(feature = "gpu", feature = "vhost-user"))]
 use devices::display::{DisplayInfo, DisplayInfoEdid, PhysicalSize};
+#[cfg(feature = "gpu")]
+use devices::display::NoopDisplayBackend;
+#[cfg(feature = "gpu")]
+use devices::virtio::gpu::VIRGLRENDERER_NO_VIRGL;
+#[cfg(feature = "gpu")]
+use krun_display::IntoDisplayBackend;
 use devices::legacy::IrqChip;
 #[cfg(not(feature = "tee"))]
 use devices::virtio::balloon::FreePageReportingMode;
@@ -1822,6 +1828,19 @@ impl GpuDevice {
     pub fn shm_size(mut self, size: usize) -> Self {
         self.shm_size = size;
         self
+    }
+
+    /// A gpu device without scanouts, for a guest that only uses its contexts and blobs.
+    pub fn without_display(shm_size: usize) -> Self {
+        Self {
+            // No virgl capsets: the device then offers one, the context's.
+            virgl_flags: VIRGLRENDERER_NO_VIRGL,
+            backend: DisplayBackend {
+                inner: NoopDisplayBackend::into_display_backend(None),
+                displays: Vec::new(),
+            },
+            shm_size,
+        }
     }
 }
 

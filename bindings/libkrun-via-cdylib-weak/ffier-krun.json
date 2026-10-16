@@ -2429,6 +2429,25 @@
             "type": "Self"
           },
           "ffi_name": "krun_gpu_device_shm_size"
+        },
+        {
+          "name": "without_display",
+          "doc": [
+            " A gpu device without scanouts, for a guest that only uses its contexts and blobs."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "shm_size",
+              "param_kind": "regular",
+              "type": "usize"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "GpuDevice"
+          },
+          "ffi_name": "krun_gpu_device_without_display"
         }
       ],
       "cfg": "feature = \"gpu\""

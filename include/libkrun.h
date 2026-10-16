@@ -633,6 +633,9 @@ KrunGpuDevice krun_gpu_device_new(uint32_t virgl_flags, KrunDisplayBackend backe
 typedef KrunGpuDevice (*krun_gpu_device_new_fn)(uint32_t virgl_flags, KrunDisplayBackend backend);
 void krun_gpu_device_shm_size(KrunGpuDevice* handle, size_t size);
 typedef void (*krun_gpu_device_shm_size_fn)(KrunGpuDevice* handle, size_t size);
+/** A gpu device without scanouts, for a guest that only uses its contexts and blobs. */
+KrunGpuDevice krun_gpu_device_without_display(size_t shm_size);
+typedef KrunGpuDevice (*krun_gpu_device_without_display_fn)(size_t shm_size);
 void krun_gpu_device_destroy(KrunGpuDevice handle);
 typedef void (*krun_gpu_device_destroy_fn)(KrunGpuDevice handle);
 

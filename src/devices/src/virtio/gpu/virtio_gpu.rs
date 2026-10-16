@@ -51,7 +51,7 @@ use crate::virtio::{InterruptTransport, VirtioShmRegion};
 const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
 const VIRGLRENDERER_USE_GLES: u32 = 1 << 4;
 const VIRGLRENDERER_VENUS: u32 = 1 << 6;
-const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+pub const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 const VIRGLRENDERER_DRM: u32 = 1 << 10;
 
@@ -943,6 +943,11 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let offset = aligned_blob_map_offset(offset, page_size).ok_or_else(|| {
+            error!("blob {resource_id}: offset {offset:#x} is not on a {page_size}-byte host page");
+            ErrUnspec
+        })?;
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
         let map_ptr = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr;
 
@@ -956,7 +961,13 @@ impl VirtioGpu {
                     resource.size,
                     shm_region.size as u64,
                 )
-                .ok_or(ErrUnspec)?;
+                .ok_or_else(|| {
+                    error!(
+                        "blob {resource_id}: offset {offset:#x} and size {} leave the {}-byte host-visible window",
+                        resource.size, shm_region.size
+                    );
+                    ErrUnspec
+                })?;
                 debug!(
                     "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
                     map_ptr, guest_addr, resource.size
@@ -1063,6 +1074,11 @@ impl VirtioGpu {
 
 // A guest-controlled `offset` that wraps `offset + size` or `base + offset` would
 // otherwise pass the size guard and place the mmap(MAP_FIXED) out of bounds.
+// Hypervisor.framework maps whole host pages, so a blob placed off a page boundary can't be mapped.
+fn aligned_blob_map_offset(offset: u64, page_size: u64) -> Option<u64> {
+    (offset % page_size == 0).then_some(offset)
+}
+
 fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Option<u64> {
     if offset.checked_add(size)? > shm_size {
         return None;
@@ -1073,6 +1089,14 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 #[cfg(test)]
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
+
+    #[test]
+    fn map_blob_rejects_unaligned_offset() {
+        use super::aligned_blob_map_offset;
+        assert_eq!(aligned_blob_map_offset(4096, 16384), None);
+        assert_eq!(aligned_blob_map_offset(32768, 16384), Some(32768));
+        assert_eq!(aligned_blob_map_offset(0, 16384), Some(0));
+    }
 
     #[test]
     fn checked_blob_map_addr_rejects_out_of_range_and_wrapping_offsets() {
