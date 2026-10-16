@@ -1429,7 +1429,30 @@ fn load_external_kernel(
         KernelFormat::PeGz => {
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::PeGzOpenKernel)?;
-            if let Some(magic) = data
+            // An EFI zboot image (arm64 distribution kernels, Fedora's among them) describes its payload: "zimg" at 4,
+            // the payload's offset and size at 8 and 12, its compressor's name at 0x18.
+            if data.len() >= 0x20 && &data[4..8] == b"zimg" {
+                let field = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+                let (offset, size) = (field(8), field(12));
+                let payload = data
+                    .get(offset..offset + size)
+                    .ok_or(StartMicrovmError::PeGzInvalid)?;
+                let mut kernel_data: Vec<u8> = Vec::new();
+                match &data[0x18..0x1c] {
+                    b"gzip" => GzDecoder::new(payload)
+                        .read_to_end(&mut kernel_data)
+                        .map(|_| ())
+                        .map_err(StartMicrovmError::PeGzDecoder)?,
+                    b"zstd" => zstd::stream::copy_decode(payload, &mut kernel_data)
+                        .map_err(StartMicrovmError::PeGzDecoder)?,
+                    _ => return Err(StartMicrovmError::PeGzInvalid),
+                }
+                debug!("EFI zboot payload: {size} bytes at 0x{offset:x}, {} decompressed", kernel_data.len());
+                guest_mem
+                    .write(&kernel_data, GuestAddress(0x8000_0000))
+                    .unwrap();
+                GuestAddress(0x8000_0000)
+            } else if let Some(magic) = data
                 .windows(3)
                 .position(|window| window == [0x1f, 0x8b, 0x8])
             {
