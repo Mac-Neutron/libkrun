@@ -412,6 +412,20 @@ impl HvfVcpu<'_> {
             return Err(Error::VcpuCreate);
         }
 
+        // Apple's EnTSO, bit 1 of ACTLR_EL1: the vCPU orders memory like x86 (TSO). A stock guest kernel never writes
+        // ACTLR_EL1, so every guest thread runs with TSO and an x86 translator such as FEX needs no ordering barriers.
+        const ACTLR_EL1_ENTSO: u64 = 1 << 1;
+        let reg = hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1;
+        let mut actlr: u64 = 0;
+        if unsafe { hv_vcpu_get_sys_reg(vcpuid, reg, &mut actlr) } != HV_SUCCESS
+            || unsafe { hv_vcpu_set_sys_reg(vcpuid, reg, actlr | ACTLR_EL1_ENTSO) } != HV_SUCCESS
+            || unsafe { hv_vcpu_get_sys_reg(vcpuid, reg, &mut actlr) } != HV_SUCCESS
+            || actlr & ACTLR_EL1_ENTSO == 0
+        {
+            return Err(Error::VcpuSetSystemRegister(reg, actlr | ACTLR_EL1_ENTSO));
+        }
+        debug!("vCPU {vcpuid}: ACTLR_EL1 = 0x{actlr:x} (TSO)");
+
         let vcpu_exit: &hv_vcpu_exit_t = unsafe { vcpu_exit_ptr.as_mut().unwrap() };
 
         Ok(Self {
