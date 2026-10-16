@@ -97,17 +97,36 @@ impl Balloon {
                     desc.addr, host_addr, desc.len
                 );
                 #[cfg(target_os = "linux")]
-                let advice = libc::MADV_DONTNEED;
-                #[cfg(target_os = "macos")]
-                let advice = libc::MADV_FREE;
-                #[cfg(unix)]
                 unsafe {
                     libc::madvise(
                         host_addr as *mut libc::c_void,
                         desc.len.try_into().unwrap(),
-                        advice,
+                        libc::MADV_DONTNEED,
                     )
                 };
+                // While the VM maps a page a vCPU has written, madvise frees nothing: the host process stays charged
+                // for every page the guest ever touched. The guest holds reported pages back until we return the
+                // descriptor, so take the range out of the VM, free it, and map it back; the guest's next write
+                // faults in a zero page that is charged again.
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    use hvf::bindings::{
+                        hv_vm_map, hv_vm_unmap, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
+                    };
+                    let len: usize = desc.len.try_into().unwrap();
+                    if hv_vm_unmap(desc.addr.0, len) == 0 {
+                        libc::madvise(host_addr as *mut libc::c_void, len, libc::MADV_FREE);
+                        if hv_vm_map(
+                            host_addr as *mut libc::c_void,
+                            desc.addr.0,
+                            len,
+                            (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+                        ) != 0
+                        {
+                            error!("balloon: cannot map {:?}+{len} back into the VM", desc.addr);
+                        }
+                    }
+                }
                 #[cfg(target_os = "windows")]
                 unsafe {
                     DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, desc.len as usize)
