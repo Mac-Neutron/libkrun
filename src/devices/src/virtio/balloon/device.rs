@@ -113,6 +113,8 @@ impl Balloon {
                     use hvf::bindings::{
                         hv_vm_map, hv_vm_unmap, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
                     };
+                    static UNMAP_REFUSED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
                     let len: usize = desc.len.try_into().unwrap();
                     if hv_vm_unmap(desc.addr.0, len) == 0 {
                         libc::madvise(host_addr as *mut libc::c_void, len, libc::MADV_FREE);
@@ -123,8 +125,14 @@ impl Balloon {
                             (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
                         ) != 0
                         {
-                            error!("balloon: cannot map {:?}+{len} back into the VM", desc.addr);
+                            // The guest would get these pages back unmapped: its accesses would turn into MMIO to
+                            // nothing, reads garbage and writes lost. Stop the VM rather than run it corrupted.
+                            error!("balloon: cannot map {:?}+{len} back into the VM; stopping", desc.addr);
+                            std::process::abort();
                         }
+                    } else if !UNMAP_REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        // e.g. a range below the host's 16 KB page: the pages stay charged to the host.
+                        warn!("balloon: Hypervisor.framework refused to unmap {:?}+{len}; reported pages stay charged", desc.addr);
                     }
                 }
                 #[cfg(target_os = "windows")]
