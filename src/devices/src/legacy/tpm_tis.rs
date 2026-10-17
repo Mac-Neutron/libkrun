@@ -79,6 +79,7 @@ pub struct TpmTis {
     buffer: Vec<u8>,
     read: usize,
     running: Option<JoinHandle<Vec<u8>>>,
+    aborted: Option<JoinHandle<Vec<u8>>>,
     int_enable: u32,
     int_vector: u8,
 }
@@ -93,12 +94,19 @@ impl TpmTis {
             buffer: Vec::with_capacity(TPM_BUFFER_SIZE),
             read: 0,
             running: None,
+            aborted: None,
             int_enable: 0,
             int_vector: 0,
         }
     }
 
     fn finish(&mut self) {
+        if self.aborted.as_ref().is_some_and(|h| h.is_finished()) {
+            self.aborted = None;
+            if self.state == State::Idle {
+                self.state = State::Ready;
+            }
+        }
         if self.state == State::Execution && self.running.as_ref().is_some_and(|h| h.is_finished()) {
             self.buffer = self.running.take().unwrap().join().unwrap_or_else(|_| tpm_failure());
             self.read = 0;
@@ -164,11 +172,14 @@ impl TpmTis {
     fn write_sts(&mut self, value: u32) {
         self.finish();
         if value & STS_COMMAND_READY != 0 {
-            // Aborting a command leaves it to finish on its thread, unheard; the backend's lock queues the next.
-            self.running = None;
+            // An aborted command finishes on its thread, unheard, and the device is ready again only once it has: one
+            // command thread at a time, however often the guest aborts.
+            if let Some(running) = self.running.take().filter(|h| !h.is_finished()) {
+                self.aborted = Some(running);
+            }
             self.buffer.clear();
             self.read = 0;
-            self.state = State::Ready;
+            self.state = if self.aborted.is_some() { State::Idle } else { State::Ready };
         } else if value & STS_GO != 0 {
             if self.state == State::Reception && self.buffer.len() >= self.expected() {
                 let command = std::mem::take(&mut self.buffer);
@@ -359,6 +370,37 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         assert_eq!(read32(&mut tis, STS) & STS_DATA_AVAIL, 0);
         assert_ne!(read32(&mut tis, STS) & STS_EXPECT, 0);
+    }
+
+    #[test]
+    fn an_aborted_command_holds_the_device_until_it_ends() {
+        struct Gate(Arc<Mutex<bool>>);
+        impl TpmBackend for Gate {
+            fn execute(&mut self, locality: u8, command: &[u8]) -> Vec<u8> {
+                while !*self.0.lock().unwrap() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Echo.execute(locality, command)
+            }
+        }
+        let open = Arc::new(Mutex::new(false));
+        let mut tis = TpmTis::new(Box::new(Gate(open.clone())));
+        write8(&mut tis, ACCESS, ACCESS_REQUEST_USE);
+        send(&mut tis, &COMMAND);
+        for _ in 0..3 {
+            write8(&mut tis, STS, STS_COMMAND_READY as u8);
+            assert_eq!(read32(&mut tis, STS) & STS_COMMAND_READY, 0, "ready while the aborted command runs");
+            write8(&mut tis, DATA_FIFO, COMMAND[0]);
+            write8(&mut tis, STS, STS_GO as u8);
+        }
+        *open.lock().unwrap() = true;
+        let start = Instant::now();
+        while read32(&mut tis, STS) & STS_COMMAND_READY == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "never ready again");
+            thread::sleep(Duration::from_millis(1));
+        }
+        send(&mut tis, &COMMAND);
+        assert_eq!(receive(&mut tis).len(), 15, "the next command after it");
     }
 
     #[test]
