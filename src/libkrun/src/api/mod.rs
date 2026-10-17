@@ -41,6 +41,8 @@ pub use device_builders::NetFlags;
 pub use device_builders::PciDeviceManager;
 #[cfg(not(feature = "tee"))]
 pub use device_builders::RngDevice;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use device_builders::TpmDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 pub use device_builders::VhostUserDevice;
 pub use device_builders::{
@@ -128,6 +130,10 @@ ffier::library_definition!("krun", library_tag = 1,
     #[cfg(not(feature = "tee"))]
     crate::api::device_builders::AttachDevice for crate::api::device_builders::RngDevice,
     crate::api::device_builders::AttachDevice for crate::api::device_builders::VsockDevice,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    crate::api::device_builders::TpmDevice = 27,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    crate::api::device_builders::AttachDevice for crate::api::device_builders::TpmDevice,
     trait ffier_builtins::PushStr = 12,
     trait ffier_builtins::Error = 13,
     Error for crate::api::error::VmmError,

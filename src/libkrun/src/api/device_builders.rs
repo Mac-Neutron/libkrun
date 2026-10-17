@@ -36,6 +36,8 @@ use krun_display::IntoDisplayBackend;
 use devices::legacy::IrqChip;
 #[cfg(not(feature = "tee"))]
 use devices::virtio::balloon::FreePageReportingMode;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use devices::{BusDevice, DeviceType};
 #[cfg(feature = "blk")]
 use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -163,6 +165,22 @@ impl<'a> AttachContext<'a> {
     ) -> Result<(), VmmError> {
         self.event_manager
             .add_subscriber(subscriber)
+            .map_err(|e| VmmError::Internal(format!("{e:?}")))
+    }
+
+    /// Register a platform (non-virtio) MMIO device: `len` bytes of the bus and a device-tree node of
+    /// `device_type`, without an interrupt.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn register_platform(
+        &mut self,
+        device_type: DeviceType,
+        id: &str,
+        len: u64,
+        device: Arc<Mutex<dyn BusDevice>>,
+    ) -> Result<(), VmmError> {
+        self.vmm
+            .mmio_device_manager
+            .register_mmio_platform(device_type, id.to_string(), len, device)
             .map_err(|e| VmmError::Internal(format!("{e:?}")))
     }
 
@@ -2086,6 +2104,101 @@ impl<'a> AttachDevice<'a> for InputDevice<'a> {
         let inner = Arc::new(Mutex::new(input));
         let id = inner.lock().unwrap().id().to_string();
         ctx.register(&id, inner)
+    }
+}
+
+/// The VMM host's TPM engine, as C: `struct krun_tpm_backend` (libkrun_tpm.h).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TpmBackendVtable {
+    userdata: *mut std::ffi::c_void,
+    execute: Option<
+        unsafe extern "C" fn(*mut std::ffi::c_void, u8, *const u8, usize, *mut u8, usize) -> i32,
+    >,
+}
+
+// The backend promises its userdata to any one thread at a time (libkrun_tpm.h).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for TpmBackendVtable {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl devices::legacy::TpmBackend for TpmBackendVtable {
+    fn execute(&mut self, locality: u8, command: &[u8]) -> Vec<u8> {
+        let mut response = vec![0u8; devices::legacy::TPM_BUFFER_SIZE];
+        let execute = self.execute.expect("checked in TpmDevice::new");
+        let len = unsafe {
+            execute(
+                self.userdata,
+                locality,
+                command.as_ptr(),
+                command.len(),
+                response.as_mut_ptr(),
+                response.len(),
+            )
+        };
+        if !(10..=response.len() as i32).contains(&len) {
+            return devices::legacy::tpm_failure();
+        }
+        response.truncate(len as usize);
+        response
+    }
+}
+
+/// A TPM 2.0 for the guest (TIS over MMIO, "tcg,tpm-tis-mmio"), whose commands the VMM host's backend runs.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct TpmDevice {
+    backend: TpmBackendVtable,
+}
+
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "all(target_os = \"macos\", target_arch = \"aarch64\")")
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(all(target_os = "macos", target_arch = "aarch64"))
+)]
+impl TpmDevice {
+    /// Create from a backend vtable.
+    ///
+    /// # Safety
+    ///
+    /// `backend` must point to a valid `struct krun_tpm_backend` of at least `backend_size` bytes. It is copied; its
+    /// userdata must outlive the VM.
+    pub unsafe fn new(
+        backend: *const std::ffi::c_void,
+        backend_size: usize,
+    ) -> Result<Self, VmmError> {
+        if backend.is_null() || backend_size < std::mem::size_of::<TpmBackendVtable>() {
+            return Err(VmmError::InvalidParam());
+        }
+        let backend: TpmBackendVtable = unsafe { std::ptr::read_unaligned(backend as *const _) };
+        if backend.execute.is_none() {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(Self { backend })
+    }
+}
+
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(cfg = "all(target_os = \"macos\", target_arch = \"aarch64\")")
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(all(target_os = "macos", target_arch = "aarch64"))
+)]
+impl<'a> AttachDevice<'a> for TpmDevice {
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        let tis = devices::legacy::TpmTis::new(Box::new(self.backend));
+        ctx.register_platform(
+            DeviceType::Tpm,
+            "tpm",
+            devices::legacy::TPM_TIS_SIZE,
+            Arc::new(Mutex::new(tis)),
+        )
     }
 }
 

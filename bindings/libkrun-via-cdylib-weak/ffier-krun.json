@@ -320,6 +320,14 @@
         }
       }
     },
+    "TpmDevice": {
+      "kind": {
+        "handle": {
+          "c_name": "KrunTpmDevice"
+        }
+      },
+      "type_tag": 16777243
+    },
     "TsiFlags": {
       "kind": {
         "bitflags": {
@@ -2541,6 +2549,47 @@
         }
       ],
       "cfg": "feature = \"input\""
+    },
+    {
+      "name": "TpmDevice",
+      "destroy_ffi_name": "krun_tpm_device_destroy",
+      "is_builder_type": false,
+      "methods": [
+        {
+          "name": "new",
+          "doc": [
+            " Create from a backend vtable.",
+            "",
+            " # Safety",
+            "",
+            " `backend` must point to a valid `struct krun_tpm_backend` of at least `backend_size` bytes. It is copied; its",
+            " userdata must outlive the VM."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "backend",
+              "param_kind": "regular",
+              "type": "*const core::ffi::c_void"
+            },
+            {
+              "name": "backend_size",
+              "param_kind": "regular",
+              "type": "usize"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "TpmDevice"
+            },
+            "err_type": "VmmError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_tpm_device_new"
+        }
+      ],
+      "cfg": "all(target_os = \"macos\", target_arch = \"aarch64\")"
     }
   ],
   "errors": [
@@ -3196,6 +3245,18 @@
         "a"
       ],
       "methods": []
+    },
+    {
+      "trait_name": "AttachDevice",
+      "struct_name": "TpmDevice",
+      "lifetimes": [
+        "a"
+      ],
+      "trait_lifetime_args": [
+        "a"
+      ],
+      "methods": [],
+      "cfg": "all(target_os = \"macos\", target_arch = \"aarch64\")"
     },
     {
       "trait_name": "Error",

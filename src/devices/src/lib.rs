@@ -53,6 +53,9 @@ pub enum DeviceType {
     /// Device Type: RTC.
     #[cfg(target_arch = "aarch64")]
     RTC,
+    /// Device Type: TPM (TIS over MMIO).
+    #[cfg(target_arch = "aarch64")]
+    Tpm,
 }
 
 impl fmt::Display for DeviceType {

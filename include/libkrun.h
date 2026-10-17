@@ -29,7 +29,8 @@ typedef void* KrunVhostUserDevice;
 typedef void* KrunDisplayBackend;
 typedef void* KrunGpuDevice;
 typedef void* KrunInputDevice;
-typedef void* KrunAttachDevice; /* KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
+typedef void* KrunTpmDevice;
+typedef void* KrunAttachDevice; /* KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunTpmDevice */
 typedef void* KrunDeviceManager; /* KrunMmioDeviceManager | KrunPciDeviceManager */
 typedef void* KrunError; /* KrunVmmError | KrunVtableError */
 typedef void* KrunPushStr; /* KrunVtablePushStr */
@@ -37,7 +38,7 @@ typedef void* KrunPushStr; /* KrunVtablePushStr */
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
+typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice | KrunTpmDevice */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -664,6 +665,21 @@ KrunInputDevice krun_input_device_new_from_fd(int input_fd, KrunError* err_out);
 typedef KrunInputDevice (*krun_input_device_new_from_fd_fn)(int input_fd, KrunError* err_out);
 void krun_input_device_destroy(KrunInputDevice handle);
 typedef void (*krun_input_device_destroy_fn)(KrunInputDevice handle);
+
+/* TpmDevice --------------------------------------------------------- */
+
+/**
+ * Create from a backend vtable.
+ *
+ * # Safety
+ *
+ * `backend` must point to a valid `struct krun_tpm_backend` of at least `backend_size` bytes. It is copied; its
+ * userdata must outlive the VM.
+ */
+KrunTpmDevice krun_tpm_device_new(const void* backend, size_t backend_size, KrunError* err_out);
+typedef KrunTpmDevice (*krun_tpm_device_new_fn)(const void* backend, size_t backend_size, KrunError* err_out);
+void krun_tpm_device_destroy(KrunTpmDevice handle);
+typedef void (*krun_tpm_device_destroy_fn)(KrunTpmDevice handle);
 
 /* DeviceManager (dispatch) ------------------------------------------ */
 

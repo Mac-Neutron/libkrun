@@ -32,6 +32,7 @@ mod kvmgicv3;
 mod kvmioapic;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
+mod tpm_tis;
 #[cfg(target_os = "macos")]
 mod vcpu;
 #[cfg(target_arch = "x86_64")]
@@ -80,6 +81,7 @@ pub use self::kvmgicv3::KvmGicV3;
 pub use self::kvmioapic::KvmIoapic;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
+pub use self::tpm_tis::{TPM_BUFFER_SIZE, TPM_TIS_SIZE, TpmBackend, TpmTis, tpm_failure};
 pub use self::serial::Serial;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;

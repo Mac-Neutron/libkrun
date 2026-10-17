@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
-use devices::DeviceType;
+use devices::{BusDevice, DeviceType};
 use devices::fdt::DeviceInfoForFDT;
 use devices::legacy::IrqChip;
 use kernel::cmdline as kernel_cmdline;
@@ -194,6 +194,31 @@ impl MMIODeviceManager {
 
         self.mmio_base += MMIO_LEN;
         self.irq += 1;
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    /// Register a platform (non-virtio) MMIO device of `len` bytes, without an interrupt.
+    pub fn register_mmio_platform(
+        &mut self,
+        device_type: DeviceType,
+        id: String,
+        len: u64,
+        device: Arc<Mutex<dyn BusDevice>>,
+    ) -> Result<()> {
+        self.bus
+            .insert(device, self.mmio_base, len)
+            .map_err(Error::BusError)?;
+        self.id_to_dev_info.insert(
+            (device_type, id),
+            MMIODeviceInfo {
+                addr: self.mmio_base,
+                len,
+                irq: 0,
+            },
+        );
+        self.mmio_base += len.next_multiple_of(MMIO_LEN);
 
         Ok(())
     }

@@ -375,6 +375,19 @@ fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
     Ok(())
 }
 
+// No interrupts: Linux's tpm_tis polls a TPM without them.
+fn create_tpm_node<T: DeviceInfoForFDT + Clone + Debug>(
+    fdt: &mut FdtWriter,
+    dev_info: &T,
+) -> Result<()> {
+    let tpm_node = fdt.begin_node(&format!("tpm@{:x}", dev_info.addr()))?;
+    fdt.property("compatible", b"tcg,tpm-tis-mmio\0")?;
+    fdt.property("reg", &generate_prop64(&[dev_info.addr(), dev_info.length()]))?;
+    fdt.end_node(tpm_node)?;
+
+    Ok(())
+}
+
 fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &T,
@@ -427,6 +440,7 @@ fn create_devices_node<T: DeviceInfoForFDT + Clone + Debug>(
         match device_type {
             DeviceType::Gpio => create_gpio_node(fdt, info)?,
             DeviceType::RTC => create_rtc_node(fdt, info)?,
+            DeviceType::Tpm => create_tpm_node(fdt, info)?,
             DeviceType::Serial => create_serial_node(fdt, info)?,
             DeviceType::Virtio(_) => {
                 ordered_virtio_device.push(info);
