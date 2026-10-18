@@ -467,6 +467,12 @@ impl Rutabaga {
         Ok(())
     }
 
+    /// A trap blob's context (its id has bit 63, MacNeutron's patch 0009): its pages are never mapped in
+    /// the VM.
+    pub fn trap_ctx(&self, resource_id: u32) -> Option<u32> {
+        self.blobs.get(&resource_id).filter(|b| b.blob_id & (1 << 63) != 0).map(|b| b.ctx_id)
+    }
+
     pub fn map_info(&self, resource_id: u32) -> RutabagaResult<u32> {
         self.blobs.get(&resource_id).ok_or(RutabagaError::InvalidResourceId)?;
         Ok(RUTABAGA_MAP_CACHE_CACHED | RUTABAGA_MAP_ACCESS_RW)
@@ -573,6 +579,18 @@ mod tests {
         r.create_context(1, MN_CAPSET_DXMT, None).unwrap();
         assert!(r.resource_create_blob(1, 10, host3d(1, 16384), None, None).is_ok());
         assert!(r.resource_create_blob(1, 11, host3d(2, 4096), None, None).is_err());
+    }
+
+    #[test]
+    fn trap_blob_has_its_context() {
+        let _l = LOCK.lock().unwrap();
+        let mut r = rutabaga(Default::default());
+        r.create_context(3, MN_CAPSET_DXMT, None).unwrap();
+        r.resource_create_blob(3, 10, host3d(1 << 63 | 7, 16384), None, None).unwrap();
+        r.resource_create_blob(3, 11, host3d(7, 16384), None, None).unwrap();
+        assert_eq!(r.trap_ctx(10), Some(3));
+        assert_eq!(r.trap_ctx(11), None);
+        assert_eq!(r.trap_ctx(12), None);
     }
 
     #[test]

@@ -440,6 +440,11 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioRead(addr, data) => {
+                    #[cfg(feature = "gpu")]
+                    if devices::virtio::gpu::trap::contains(addr) {
+                        data.fill(0);
+                        return Ok(VcpuEmulation::Handled);
+                    }
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         debug!("vCPU {vcpuid} MMIO read 0x{addr:x}");
                         mmio_bus.read(vcpuid, addr, data);
@@ -447,6 +452,10 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    #[cfg(feature = "gpu")]
+                    if devices::virtio::gpu::trap::write(addr, data) {
+                        return Ok(VcpuEmulation::Handled);
+                    }
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.write(vcpuid, addr, data);
                     }

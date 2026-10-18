@@ -41,7 +41,7 @@ use rutabaga_gfx::{
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
 
-use super::{GpuError, Result};
+use super::{GpuError, Result, trap};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
@@ -949,6 +949,32 @@ impl VirtioGpu {
             ErrUnspec
         })?;
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+
+        if let Some(ctx_id) = self.rutabaga.trap_ctx(resource_id) {
+            let guest_addr = checked_blob_map_addr(
+                shm_region.guest_addr,
+                offset,
+                resource.size,
+                shm_region.size as u64,
+            )
+            .ok_or(ErrUnspec)?;
+            // The window is backed until a blob maps over it: take the trap's pages out of the VM.
+            let (reply_sender, reply_receiver) = unbounded();
+            self.map_sender
+                .send(WorkerMessage::GpuRemoveMapping(
+                    reply_sender,
+                    guest_addr,
+                    resource.size,
+                ))
+                .unwrap();
+            if !reply_receiver.recv().unwrap() || !trap::add(guest_addr, resource.size, ctx_id) {
+                return Err(ErrUnspec);
+            }
+            resource.shmem_offset = Some(offset);
+            return Ok(OkMapInfo {
+                map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+            });
+        }
         let map_ptr = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?.ptr;
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id)
@@ -1053,6 +1079,12 @@ impl VirtioGpu {
             "unmapping: guest_addr={:x}, size={}",
             guest_addr, resource.size
         );
+
+        if self.rutabaga.trap_ctx(resource_id).is_some() {
+            trap::remove(guest_addr);
+            resource.shmem_offset = None;
+            return Ok(OkNoData);
+        }
 
         let (reply_sender, reply_receiver) = unbounded();
         self.map_sender
