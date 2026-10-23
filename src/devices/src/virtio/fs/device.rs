@@ -89,6 +89,9 @@ impl Fs {
             root_dir,
             semantics,
             attr_timeout,
+            // A read-only share serves no extended attributes: the first getxattr or listxattr answers ENOSYS, which
+            // the guest's FUSE keeps, so later ones fail EOPNOTSUPP without a round trip to the host.
+            xattr: !read_only,
             ..Default::default()
         });
 
