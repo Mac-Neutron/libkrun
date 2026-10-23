@@ -1064,7 +1064,7 @@ impl PassthroughFs {
             let ihandle = InodeHandle::Fd(fd);
 
             // Set security context
-            if let Some(secctx) = extensions.secctx {
+            if let Some(secctx) = extensions.secctx.filter(|_| self.cfg.xattr) {
                 set_secctx(&ihandle, secctx, false)?
             };
 
@@ -1118,7 +1118,7 @@ impl PassthroughFs {
         }
 
         // Set security context
-        if let Some(secctx) = extensions.secctx {
+        if let Some(secctx) = extensions.secctx.filter(|_| self.cfg.xattr) {
             let ihandle = InodeHandle::Path(c_path);
             set_secctx(&ihandle, secctx, false)?
         };
@@ -1533,7 +1533,7 @@ impl FileSystem for PassthroughFs {
         if res == 0 {
             let ihandle = InodeHandle::Path(c_path);
             // Set security context
-            if let Some(secctx) = extensions.secctx {
+            if let Some(secctx) = extensions.secctx.filter(|_| self.cfg.xattr) {
                 set_secctx(&ihandle, secctx, false)?
             };
 
@@ -1677,7 +1677,7 @@ impl FileSystem for PassthroughFs {
         }
 
         // Set security context
-        if let Some(secctx) = extensions.secctx {
+        if let Some(secctx) = extensions.secctx.filter(|_| self.cfg.xattr) {
             set_secctx(&ihandle, secctx, false)?
         };
 
@@ -2157,7 +2157,7 @@ impl FileSystem for PassthroughFs {
             let ihandle = InodeHandle::Path(c_path);
 
             // Set security context
-            if let Some(secctx) = extensions.secctx {
+            if let Some(secctx) = extensions.secctx.filter(|_| self.cfg.xattr) {
                 set_secctx(&ihandle, secctx, true)?
             };
 

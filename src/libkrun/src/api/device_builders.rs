@@ -646,12 +646,25 @@ impl<'a> FsDevice<'a> {
     /// - `tag`: the filesystem tag visible to the guest (e.g. `"/dev/root"`).
     /// - `host_path`: the host directory to share.
     pub fn new(tag: &str, host_path: &str) -> Result<Self, VmmError> {
-        Self::new_inner(tag, Some(host_path.to_string()), false)
+        Self::new_inner(tag, Some(host_path.to_string()), false, PermissionSemantics::LinuxComplete)
     }
 
     /// Create a read-only virtiofs device sharing a host directory.
     pub fn new_read_only(tag: &str, host_path: &str) -> Result<Self, VmmError> {
-        Self::new_inner(tag, Some(host_path.to_string()), true)
+        Self::new_inner(tag, Some(host_path.to_string()), true, PermissionSemantics::LinuxComplete)
+    }
+
+    /// Create a virtiofs device sharing a host directory with simplified permissions
+    /// ([`PermissionSemantics::LinuxSimplified`]): every file shows as owned by the guest
+    /// process asking, permission bits are the host file's own mode, and no extended
+    /// attributes are stored, so the host's files keep their owner and gain no xattrs.
+    pub fn new_simplified(tag: &str, host_path: &str) -> Result<Self, VmmError> {
+        Self::new_inner(
+            tag,
+            Some(host_path.to_string()),
+            false,
+            PermissionSemantics::LinuxSimplified,
+        )
     }
 
     /// Create a virtiofs device with no host directory (NullFs).
@@ -660,7 +673,7 @@ impl<'a> FsDevice<'a> {
     /// virtual entries and [`set_overlay`](Self::set_overlay) to attach
     /// them.
     pub fn new_null(tag: &str) -> Result<Self, VmmError> {
-        Self::new_inner(tag, None, false)
+        Self::new_inner(tag, None, false, PermissionSemantics::LinuxComplete)
     }
 
     /// Set a pre-built [`FsOverlay`] on this device.
@@ -683,11 +696,16 @@ impl<'a> FsDevice<'a> {
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 impl<'a> FsDevice<'a> {
-    fn new_inner(tag: &str, host_path: Option<String>, read_only: bool) -> Result<Self, VmmError> {
+    fn new_inner(
+        tag: &str,
+        host_path: Option<String>,
+        read_only: bool,
+        semantics: PermissionSemantics,
+    ) -> Result<Self, VmmError> {
         let exit_code = Arc::new(AtomicI32::new(i32::MAX));
         let fs = devices::virtio::Fs::new(
             tag.to_string(),
-            PermissionSemantics::LinuxComplete,
+            semantics,
             host_path,
             exit_code.clone(),
             read_only,

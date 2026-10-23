@@ -90,8 +90,10 @@ impl Fs {
             semantics,
             attr_timeout,
             // A read-only share serves no extended attributes: the first getxattr or listxattr answers ENOSYS, which
-            // the guest's FUSE keeps, so later ones fail EOPNOTSUPP without a round trip to the host.
-            xattr: !read_only,
+            // the guest's FUSE keeps, so later ones fail EOPNOTSUPP without a round trip to the host. Nor does a
+            // simplified one, whose host files must gain none (LinuxSimplified: "Extended attributes are not
+            // supported").
+            xattr: !read_only && matches!(semantics, PermissionSemantics::LinuxComplete),
             ..Default::default()
         });
 

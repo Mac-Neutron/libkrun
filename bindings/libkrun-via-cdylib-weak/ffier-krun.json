@@ -584,6 +584,42 @@
           "ffi_name": "krun_fs_device_new_read_only"
         },
         {
+          "name": "new_simplified",
+          "doc": [
+            " Create a virtiofs device sharing a host directory with simplified permissions",
+            " ([`PermissionSemantics::LinuxSimplified`]): every file shows as owned by the guest",
+            " process asking, permission bits are the host file's own mode, and no extended",
+            " attributes are stored, so the host's files keep their owner and gain no xattrs."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "tag",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "host_path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "FsDevice",
+              "type_args": [
+                "a"
+              ]
+            },
+            "err_type": "VmmError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_fs_device_new_simplified"
+        },
+        {
           "name": "new_null",
           "doc": [
             " Create a virtiofs device with no host directory (NullFs).",

@@ -225,6 +225,14 @@ typedef KrunFsDevice (*krun_fs_device_new_fn)(KrunStr tag, KrunStr host_path, Kr
 KrunFsDevice krun_fs_device_new_read_only(KrunStr tag, KrunStr host_path, KrunError* err_out);
 typedef KrunFsDevice (*krun_fs_device_new_read_only_fn)(KrunStr tag, KrunStr host_path, KrunError* err_out);
 /**
+ * Create a virtiofs device sharing a host directory with simplified permissions
+ * ([`PermissionSemantics::LinuxSimplified`]): every file shows as owned by the guest
+ * process asking, permission bits are the host file's own mode, and no extended
+ * attributes are stored, so the host's files keep their owner and gain no xattrs.
+ */
+KrunFsDevice krun_fs_device_new_simplified(KrunStr tag, KrunStr host_path, KrunError* err_out);
+typedef KrunFsDevice (*krun_fs_device_new_simplified_fn)(KrunStr tag, KrunStr host_path, KrunError* err_out);
+/**
  * Create a virtiofs device with no host directory (NullFs).
  *
  * The guest sees an empty filesystem. Use [`FsOverlay`] to build
