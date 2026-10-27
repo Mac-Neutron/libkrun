@@ -2205,39 +2205,6 @@ impl FileSystem for PassthroughFs {
         Ok(buf)
     }
 
-    fn flush(
-        &self,
-        _ctx: Context,
-        inode: Inode,
-        handle: Handle,
-        _lock_owner: u64,
-    ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        // Since this method is called whenever an fd is closed in the client, we can emulate that
-        // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
-        // because this doesn't modify any memory and we check the return values.
-        unsafe {
-            let newfd = libc::dup(data.file.write().unwrap().as_raw_fd());
-            if newfd < 0 {
-                return Err(linux_error(io::Error::last_os_error()));
-            }
-
-            if libc::close(newfd) < 0 {
-                Err(linux_error(io::Error::last_os_error()))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
     fn fsync(
         &self,
         _ctx: Context,
