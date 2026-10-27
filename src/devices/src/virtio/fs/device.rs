@@ -77,13 +77,10 @@ impl Fs {
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
-        let attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
-            // As uid/gid are context-dependent, attributes can't be cached.
-            Duration::from_secs(0)
-        } else {
-            // The value defined as default in virtio-fs.
-            Duration::from_secs(5)
-        };
+        // The value defined as default in virtio-fs, for a simplified share too: its uid/gid are the asking process's,
+        // which MacNeutron's guest makes one user (mn), and uncached each stat and each read's size check were a round
+        // trip to the host.
+        let attr_timeout = Duration::from_secs(5);
 
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
