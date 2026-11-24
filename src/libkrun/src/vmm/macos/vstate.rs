@@ -501,6 +501,17 @@ impl Vcpu {
 
     /// Main loop of the vCPU thread.
     pub fn run(&mut self, init_tls_sender: Sender<u64>) {
+        unsafe {
+            const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(
+                    qos_class: libc::c_uint,
+                    relative_priority: libc::c_int,
+                ) -> libc::c_int;
+            }
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+
         let mut hvf_vcpu =
             HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
         let hvf_vcpuid = hvf_vcpu.id();

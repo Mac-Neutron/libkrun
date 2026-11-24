@@ -28,6 +28,17 @@ pub fn start_worker_thread(
     std::thread::Builder::new()
         .name("vmm worker".into())
         .spawn(move || {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: libc::c_uint,
+                        relative_priority: libc::c_int,
+                    ) -> libc::c_int;
+                }
+                pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+            }
             // This ends once every sender is gone, as no message can arrive anymore.
             for message in receiver {
                 let Some(vmm) = vmm.upgrade() else {
