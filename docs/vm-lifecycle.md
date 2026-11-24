@@ -40,6 +40,11 @@ Create an `MmioDeviceManager` with `MmioDeviceManager::new()` (C API: `krun_mmio
 
 - **Console**: `ConsoleBuilder` configures standard or multiport virtio-console streams.
 - **Filesystem**: `FsDevice` exposes host directories via virtiofs with optional overlays.
+  Call `set_cache_policy()` before attaching it to select `CachePolicy::Auto` (the default),
+  `Never` or `Always`. Use `Never` for files modified outside the guest; reserve `Always`
+  for directories accessed exclusively through this filesystem.
+  `set_cache_timeouts()` sets how long lookups and attributes are cached (5000 ms by
+  default); use 0 for directories the host modifies while the guest uses them.
 - **Network**:
   - **TSI (Transparent Socket Impersonation)**: Built into `VsockDevice` with `TsiFlags::HIJACK_INET` and port forwarding.
   - **Virtio-net**: `NetDevice` connected via Unix stream or datagram socket (e.g. to `passt` or `gvproxy`).
@@ -47,6 +52,23 @@ Create an `MmioDeviceManager` with `MmioDeviceManager::new()` (C API: `krun_mmio
 - **Acceleration & GUI**: `GpuDevice` (Venus / native context) and `InputDevice` (mouse/keyboard).
 - **vhost-user**: `VhostUserDevice` for external virtio backends (RNG, RTC, GPU, Sound, CAN, Media).
 - **Utilities**: `RngDevice` (virtio-rng) and `BalloonDevice` (virtio-balloon page reporting).
+- **RTC**: on x86_64 and aarch64 Linux/KVM, add `RtcDevice::new()?` to the device manager to
+  enable virtio-rtc. It offers a UTC clock with an alarm, a TAI clock and a
+  monotonic clock, which a compatible guest driver exposes as PTP clocks and
+  an RTC. Cross-timestamping is not supported. Adding this device suppresses
+  the legacy PL031 RTC on aarch64. Without it, the legacy RTC remains in use.
+  On x86_64/Linux, CMOS only supplies memory configuration and remains present.
+  On riscv64, which has no legacy RTC, the VMM adds virtio-rtc implicitly unless
+  an RTC device is already supplied through the device manager.
+
+```rust
+let mut devices = MmioDeviceManager::new();
+devices.add(RtcDevice::new()?);
+```
+
+The C API provides `krun_rtc_device_new()`; pass its handle to
+`krun_mmio_device_manager_add()` or `krun_pci_device_manager_add()`.
+The caller must ensure its guest kernel supports virtio-rtc before enabling it.
 
 ## 4. VMM Builder
 
@@ -57,10 +79,20 @@ Create an `MmioDeviceManager` with `MmioDeviceManager::new()` (C API: `krun_mmio
 - `payload(payload)`: The configured boot payload.
 - `devices(device_manager)`: The registered MMIO devices.
 - `split_irqchip(enabled)`: Configures interrupt controller mode on x86_64.
+- `invariant_tsc(enabled)`: Exposes the host's invariant TSC capability to x86_64
+  guests when supported by KVM or WHP. Disabled by default, allowing Linux guests
+  to prefer a paravirtual clock. Opt in with `invariant_tsc(true)?` (C API:
+  `krun_vmm_builder_invariant_tsc()`) to allow the guest to select TSC as its
+  clocksource. This controls CPUID.80000007H:EDX[8]; it does not stop the TSC
+  during a VM pause. Enabling it on other architectures returns `InvalidParam`.
 
 ## 5. Execution & Control
 
 Building the `VmmBuilder` produces a `Vmm` instance:
 
 - **Foreground Execution**: Calling `vmm.run()` (C API: `krun_vmm_run()`) starts vCPUs, enters the guest event loop, and blocks until VM termination.
-- **Background Control**: Call `vmm.handle()` (C API: `krun_vmm_handle`) on the built `Vmm` before `vmm.run()` consumes it, then move the `VmmHandle` to another thread. Pause and resume are supported on macOS. Shutdown is supported on aarch64 macOS when `VmmBuilder::shutdown_support(true)` was enabled. These control methods return `FeatureDisabled` on Linux.
+- **Background Control**. Call `vmm.handle()` (`krun_vmm_handle` in C) on the built `Vmm` before `vmm.run()` consumes it, then move the `VmmHandle` to another thread.
+  Pause and resume are supported on macOS and Linux, except for SEV and TDX guests and with a split irqchip, where they return `FeatureDisabled`.
+  A successful call queues the request for asynchronous processing, and the VMM logs any execution failures.
+  The guest's clock is held while paused. On x86_64 Linux this applies to kvmclock, so a guest timing with the TSC sees the pause.
+  Shutdown is supported on aarch64 macOS when `VmmBuilder::shutdown_support(true)` was enabled, and returns `FeatureDisabled` elsewhere.

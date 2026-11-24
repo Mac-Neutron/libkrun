@@ -14,6 +14,8 @@ use std::fs::File;
 #[cfg(not(target_os = "windows"))]
 use std::io::Read;
 use std::io::{self, IsTerminal};
+#[cfg(target_os = "macos")]
+use std::ops::Range;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -27,8 +29,13 @@ use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
+#[cfg(target_os = "linux")]
+use super::VcpuRunState;
 use super::{Error, Vmm};
 
+#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+use crate::api::{AttachContext, AttachDevice, RtcDevice};
+use crate::vmm::device_manager::irq::IrqAllocator;
 #[cfg(target_arch = "x86_64")]
 use crate::vmm::device_manager::legacy::PortIODeviceManager;
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
@@ -61,6 +68,8 @@ use kbs_types::Tee;
 use crate::vmm::device_manager;
 #[cfg(feature = "tdx")]
 use crate::vmm::linux::tee::tdshim::{self, TdShim};
+#[cfg(windows)]
+use crate::vmm::terminal::term_acquire_utf8_output;
 use crate::vmm::terminal::{term_restore_mode, term_set_raw_mode};
 #[cfg(feature = "tdx")]
 use crate::vmm::vmm_config::firmware::TeeFirmwareType;
@@ -69,6 +78,8 @@ use crate::vmm::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 use crate::vmm::vstate::KvmContext;
 #[cfg(all(target_os = "linux", feature = "tee"))]
 use crate::vmm::vstate::MeasuredRegion;
+#[cfg(target_os = "macos")]
+use crate::vmm::vstate::map_guest_ram_in_blocks;
 use crate::vmm::vstate::{Error as VstateError, Vcpu, VcpuConfig, Vm};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use device_manager::shm::ShmManager;
@@ -81,11 +92,13 @@ use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use linux_loader::loader::{self, KernelLoader};
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
+#[cfg(target_os = "macos")]
+use utils::worker_message::RECLAIM_BLOCK_SIZE;
 use utils::worker_message::WorkerMessage;
 use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 use vm_memory::FileOffset;
-#[cfg(feature = "tdx")]
+#[cfg(any(feature = "tdx", target_os = "linux"))]
 use vm_memory::GuestMemoryRegion;
 #[cfg(all(
     target_arch = "x86_64",
@@ -778,6 +791,8 @@ pub fn build_microvm(
     };
 
     let requirements = device_manager.requirements();
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let legacy_rtc = !requirements.iter().any(|r| r.replaces_legacy_rtc);
     #[cfg(all(
         target_arch = "x86_64",
         any(target_os = "linux", target_os = "windows")
@@ -807,6 +822,8 @@ pub fn build_microvm(
     #[cfg(not(feature = "gpu"))]
     let gpu_shm_size: Option<usize> = None;
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
+    #[cfg(target_os = "macos")]
+    let ram_in_blocks = requirements.iter().any(|r| r.replaces_guest_ram);
 
     #[cfg(feature = "tdx")]
     let td_shim_parsed = match &vm_resources.tee_firmware_config {
@@ -843,6 +860,10 @@ pub fn build_microvm(
         gpu_shm_size,
         use_vhost_user,
         &payload,
+        #[cfg(target_os = "macos")]
+        ram_in_blocks,
+        #[cfg(target_os = "linux")]
+        vm_resources.transparent_huge_pages,
         #[cfg(feature = "tee")]
         fw_range_for_mem,
     )?;
@@ -920,7 +941,11 @@ pub fn build_microvm(
     )?;
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[allow(unused_mut)]
-    let mut vm = setup_vm(&guest_memory, vcpu_config.vcpu_count)?;
+    let mut vm = setup_vm(
+        &guest_memory,
+        vcpu_config.vcpu_count,
+        vm_resources.invariant_tsc,
+    )?;
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -1042,6 +1067,8 @@ pub fn build_microvm(
     // so let's keep track of FDs connected to legacy serial devices here
     // and set raw mode on them later.
     let mut serial_ttys = Vec::new();
+    #[cfg(windows)]
+    let mut has_terminal_serial_output = false;
 
     #[cfg(unix)]
     for s in &vm_resources.serial_consoles {
@@ -1066,33 +1093,61 @@ pub fn build_microvm(
 
     #[cfg(windows)]
     for s in &vm_resources.serial_consoles {
-        let input: Option<Box<dyn devices::legacy::ReadableFd + Send>> =
-            if is_valid_handle(s.input_handle) {
-                let handle = unsafe { BorrowedHandle::borrow_raw(s.input_handle) };
-                let owned_handle = handle
-                    .try_clone_to_owned()
-                    .map_err(StartMicrovmError::DuplicateSerialHandle)?;
-                if owned_handle.as_handle().is_terminal() {
-                    serial_ttys.push(
-                        owned_handle
-                            .try_clone()
-                            .map_err(StartMicrovmError::DuplicateSerialHandle)?,
-                    );
-                }
-                Some(Box::new(File::from(owned_handle)))
-            } else {
-                None
-            };
+        let mut terminal = None;
+        let input_file = if is_valid_handle(s.input_handle) {
+            let handle = unsafe { BorrowedHandle::borrow_raw(s.input_handle) };
+            let owned_handle = handle
+                .try_clone_to_owned()
+                .map_err(StartMicrovmError::DuplicateSerialHandle)?;
+            if owned_handle.as_handle().is_terminal() {
+                terminal = Some(
+                    owned_handle
+                        .try_clone()
+                        .map_err(StartMicrovmError::DuplicateSerialHandle)?,
+                );
+            }
+            Some(File::from(owned_handle))
+        } else {
+            None
+        };
 
-        let output: Option<Box<dyn io::Write + Send>> = if is_valid_handle(s.output_handle) {
+        let output_file = if is_valid_handle(s.output_handle) {
             let handle = unsafe { BorrowedHandle::borrow_raw(s.output_handle) };
             let owned_handle = handle
                 .try_clone_to_owned()
                 .map_err(StartMicrovmError::DuplicateSerialHandle)?;
-            Some(Box::new(File::from(owned_handle)))
+            Some(File::from(owned_handle))
         } else {
             None
         };
+
+        has_terminal_serial_output |= output_file.as_ref().is_some_and(File::is_terminal);
+
+        let is_interactive_console = terminal.is_some() && output_file.is_some();
+        let is_output_only_console =
+            input_file.is_none() && output_file.as_ref().is_some_and(File::is_terminal);
+        let (input, output) = match (input_file, output_file) {
+            (input, Some(output)) if is_interactive_console || is_output_only_console => {
+                let (input, output) = crate::vmm::windows::serial_console::serial_console_bridge(
+                    input,
+                    output,
+                    !is_interactive_console,
+                )
+                .map_err(StartMicrovmError::DuplicateSerialHandle)?;
+                (Some(input), Some(output))
+            }
+            (input, output) => (
+                input.map(|file| Box::new(file) as Box<dyn devices::legacy::ReadableFd + Send>),
+                output.map(|file| Box::new(file) as Box<dyn io::Write + Send>),
+            ),
+        };
+        if let Some(terminal) = terminal {
+            // Interactive consoles process raw INPUT_RECORDs in libkrun, so Windows VT
+            // translation must be disabled to avoid double-translating keys.
+            // Non-interactive paths keep VT translation enabled for byte-stream readers.
+            let enable_vt_translation = !is_interactive_console;
+            serial_ttys.push((terminal, enable_vt_translation));
+        }
 
         serial_devices.push(setup_serial_device(event_manager, input, output)?);
     }
@@ -1102,14 +1157,22 @@ pub fn build_microvm(
         .map_err(StartMicrovmError::Internal)?;
 
     #[cfg(target_arch = "x86_64")]
+    let reset_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK)
+        .map_err(Error::EventFd)
+        .map_err(StartMicrovmError::Internal)?;
+
+    #[cfg(target_arch = "x86_64")]
     // Safe to unwrap 'serial_device' as it's always 'Some' on x86_64.
-    // x86_64 uses the i8042 reset event as the Vmm exit event.
     let mut pio_device_manager = PortIODeviceManager::new(
         Arc::new(Mutex::new(Cmos::new(
             arch_memory_info.ram_below_gap,
             arch_memory_info.ram_above_gap,
         ))),
         serial_devices,
+        reset_evt
+            .try_clone()
+            .map_err(Error::EventFd)
+            .map_err(StartMicrovmError::Internal)?,
         exit_evt
             .try_clone()
             .map_err(Error::EventFd)
@@ -1118,12 +1181,21 @@ pub fn build_microvm(
     .map_err(Error::CreateLegacyDevice)
     .map_err(StartMicrovmError::Internal)?;
 
+    // Every device manager draws its interrupt lines from this one allocator,
+    // so that devices on different transports never share a line.
+    let irq_allocator = IrqAllocator::new(arch::IRQ_BASE, arch::IRQ_MAX, arch::IRQ_RESERVED);
+
     #[cfg(all(
         target_arch = "x86_64",
         any(target_os = "linux", target_os = "windows")
     ))]
     let pci_device_manager = if pci_enabled {
-        Some(device_manager::pci::PciHostManager::new())
+        #[cfg(target_os = "linux")]
+        let manager = device_manager::pci::PciHostManager::new(irq_allocator.clone());
+        #[cfg(target_os = "windows")]
+        let manager =
+            device_manager::pci::PciHostManager::new(vm.whp_vm().clone(), irq_allocator.clone());
+        Some(manager)
     } else {
         None
     };
@@ -1141,10 +1213,8 @@ pub fn build_microvm(
     // 'mmio_base' address has to be an address which is protected by the kernel
     // and is architectural specific.
     #[allow(unused_mut)]
-    let mut mmio_device_manager = MMIODeviceManager::new(
-        &mut (arch::MMIO_MEM_START.clone()),
-        (arch::IRQ_BASE, arch::IRQ_MAX),
-    );
+    let mut mmio_device_manager =
+        MMIODeviceManager::new(&mut (arch::MMIO_MEM_START.clone()), irq_allocator);
 
     #[cfg(all(
         target_arch = "x86_64",
@@ -1214,6 +1284,7 @@ pub fn build_microvm(
         )))));
 
         attach_legacy_devices_whp(
+            event_manager,
             &mut pio_device_manager,
             &mut mmio_device_manager,
             Some(intc.clone()),
@@ -1279,6 +1350,7 @@ pub fn build_microvm(
             &mut kernel_cmdline,
             intc.clone(),
             serial_devices,
+            legacy_rtc,
         )?;
     }
 
@@ -1343,7 +1415,7 @@ pub fn build_microvm(
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let (vm_ctl_tx, vm_ctl_rx) = utils::pollable_channel::pollable_channel()
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
@@ -1354,6 +1426,9 @@ pub fn build_microvm(
         kernel_cmdline,
         vcpus_handles: Vec::new(),
         exit_evt,
+        #[cfg(target_arch = "x86_64")]
+        reset_evt,
+        reset_exit_code: vm_resources.reset_exit_code,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
         #[cfg(not(target_os = "windows"))]
@@ -1364,14 +1439,25 @@ pub fn build_microvm(
             any(target_os = "linux", target_os = "windows")
         ))]
         pci_device_manager,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         vm_ctl_tx,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         vm_ctl_rx,
         #[cfg(target_os = "macos")]
         paused: false,
+        #[cfg(target_os = "linux")]
+        vcpu_run_state: VcpuRunState::Running,
         #[cfg(target_os = "macos")]
         paused_at: 0,
+        #[cfg(target_os = "macos")]
+        ram_in_blocks: payload_config.ram_in_blocks,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        paused_clock: None,
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "riscv64")
+        ))]
+        paused_counter: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -1379,7 +1465,33 @@ pub fn build_microvm(
         #[cfg(unix)]
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
         #[cfg(windows)]
-        setup_terminal_raw_mode(&mut vmm, Some(serial_tty.as_handle()), false);
+        setup_terminal_raw_mode(
+            &mut vmm,
+            Some(serial_tty.0.as_handle()),
+            false,
+            serial_tty.1,
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+    if !requirements.iter().any(|r| r.replaces_legacy_rtc) {
+        let rtc =
+            RtcDevice::new().map_err(|e| StartMicrovmError::AttachDevice(format!("{e:?}")))?;
+        let mut ctx = AttachContext::new_mmio(
+            &mut vmm,
+            event_manager,
+            &_shm_manager,
+            intc.clone(),
+            requirements.len(),
+        );
+        Box::new(rtc)
+            .attach(&mut ctx)
+            .map_err(|e| StartMicrovmError::AttachDevice(format!("{e:?}")))?;
+    }
+
+    #[cfg(windows)]
+    if has_terminal_serial_output {
+        setup_terminal_utf8_output(&mut vmm);
     }
 
     device_manager
@@ -1443,6 +1555,30 @@ pub fn build_microvm(
         any(target_os = "linux", target_os = "windows")
     )))]
     let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
+
+    // Detect RISC-V ISA information from KVM before FDT generation. This
+    // queries vCPU 0's registers directly, so it must run against the
+    // already-created vCPU 0 (`vcpus[0]`) rather than creating a new one,
+    // since KVM only allows one vCPU per id (KVM_CREATE_VCPU on an
+    // existing id fails with -EEXIST).
+    #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+    let riscv_isa_info = {
+        if let Some(isa_info) = &vm_resources.riscv_isa_info {
+            Some(isa_info.clone())
+        } else {
+            match vcpus[0].detect_riscv_isa() {
+                Ok(isa_info) => Some(isa_info),
+                Err(e) => {
+                    log::warn!("Failed to detect RISC-V ISA information: {:?}", e);
+                    None
+                }
+            }
+        }
+    };
+
+    #[cfg(not(all(target_os = "linux", target_arch = "riscv64")))]
+    let _riscv_isa_info: Option<()> = None;
+
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
@@ -1451,6 +1587,8 @@ pub fn build_microvm(
         vm_resources.acpi_enabled,
         &virtio_mmio_devices,
         payload_config.pvh,
+        #[cfg(target_arch = "riscv64")]
+        &riscv_isa_info,
     )
     .map_err(StartMicrovmError::Internal)?;
 
@@ -1937,6 +2075,38 @@ pub struct PayloadConfig {
     pub initrd_config: Option<InitrdConfig>,
     pub kernel_cmdline: Option<String>,
     pub pvh: bool,
+    /// Whether guest RAM is mapped in blocks, see [`map_guest_ram_in_blocks`].
+    #[cfg(target_os = "macos")]
+    pub ram_in_blocks: bool,
+}
+
+/// Maps guest RAM in blocks with `map`, and returns whether it worked. If it didn't, the VM still
+/// has all of its RAM, and the balloon madvise()s the pages of free page reports instead of
+/// replacing them, see `Balloon::set_guest_ram_in_blocks()`.
+#[cfg(target_os = "macos")]
+fn map_ram_in_blocks(
+    guest_mem: &GuestMemoryMmap,
+    info: &ArchMemoryInfo,
+    map: impl FnOnce(&GuestMemoryMmap, Range<u64>) -> io::Result<()>,
+) -> bool {
+    let ram = info.ram_start_addr..info.ram_last_addr;
+    match map(guest_mem, ram.clone()) {
+        Ok(()) => {
+            info!(
+                "guest RAM: mapped in {} blocks of {} MiB",
+                (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            false
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1954,6 +2124,8 @@ pub fn create_guest_memory(
     gpu_shm_size: Option<usize>,
     use_vhost_user: bool,
     payload: &Payload,
+    #[cfg(target_os = "macos")] ram_in_blocks: bool,
+    #[cfg(target_os = "linux")] transparent_huge_pages: bool,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
@@ -2105,6 +2277,31 @@ pub fn create_guest_memory(
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
 
+    #[cfg(target_os = "linux")]
+    if transparent_huge_pages {
+        for region in guest_mem.iter() {
+            // SAFETY: the range is the region's own mapping, and the advice keeps its contents.
+            let ret = unsafe {
+                libc::madvise(
+                    region.as_ptr().cast(),
+                    region.len() as usize,
+                    libc::MADV_HUGEPAGE,
+                )
+            };
+            if ret != 0 {
+                return Err(StartMicrovmError::GuestMemoryMmap(format!(
+                    "failed to enable transparent huge pages: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+        }
+    }
+
+    // Before anything is written to RAM, which this throws away.
+    #[cfg(target_os = "macos")]
+    let ram_in_blocks =
+        ram_in_blocks && map_ram_in_blocks(&guest_mem, &arch_mem_info, map_guest_ram_in_blocks);
+
     let LoadedPayload {
         guest_mem,
         entry_addr,
@@ -2136,6 +2333,8 @@ pub fn create_guest_memory(
         initrd_config,
         kernel_cmdline: cmdline,
         pvh,
+        #[cfg(target_os = "macos")]
+        ram_in_blocks,
     };
 
     arch_mem_info.guest_last_addr = guest_mem.last_addr().raw_value();
@@ -2177,8 +2376,9 @@ pub(crate) fn setup_vm(
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     vcpu_count: u8,
+    invariant_tsc: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::new(vcpu_count)
+    let mut vm = Vm::new(vcpu_count, invariant_tsc)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)
@@ -2300,6 +2500,7 @@ fn attach_legacy_devices(
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 fn attach_legacy_devices_whp(
+    event_manager: &mut EventManager,
     pio_device_manager: &mut PortIODeviceManager,
     mmio_device_manager: &mut MMIODeviceManager,
     intc: Option<Arc<Mutex<IrqChipDevice>>>,
@@ -2310,8 +2511,13 @@ fn attach_legacy_devices_whp(
         .map_err(StartMicrovmError::Internal)?;
 
     mmio_device_manager
-        .register_mmio_ioapic(intc)
+        .register_mmio_ioapic(intc.clone())
         .map_err(Error::RegisterMMIODevice)
+        .map_err(StartMicrovmError::Internal)?;
+
+    pio_device_manager
+        .register_irq_events(event_manager, intc)
+        .map_err(Error::LegacyIOBus)
         .map_err(StartMicrovmError::Internal)?;
 
     Ok(())
@@ -2354,6 +2560,7 @@ fn attach_legacy_devices(
     kernel_cmdline: &mut kernel::cmdline::Cmdline,
     intc: IrqChip,
     serial: Vec<Arc<Mutex<Serial>>>,
+    #[cfg(target_arch = "aarch64")] legacy_rtc: bool,
 ) -> std::result::Result<(), StartMicrovmError> {
     for s in serial {
         mmio_device_manager
@@ -2362,11 +2569,13 @@ fn attach_legacy_devices(
             .map_err(StartMicrovmError::Internal)?;
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    mmio_device_manager
-        .register_mmio_rtc(vm.fd())
-        .map_err(Error::RegisterMMIODevice)
-        .map_err(StartMicrovmError::Internal)?;
+    #[cfg(target_arch = "aarch64")]
+    if legacy_rtc {
+        mmio_device_manager
+            .register_mmio_rtc(vm.fd())
+            .map_err(Error::RegisterMMIODevice)
+            .map_err(StartMicrovmError::Internal)?;
+    }
 
     Ok(())
 }
@@ -2619,14 +2828,34 @@ pub fn setup_terminal_raw_mode(
     }
 }
 
+#[cfg(windows)]
+fn setup_terminal_utf8_output(vmm: &mut Vmm) {
+    match term_acquire_utf8_output() {
+        Ok(guard) => {
+            let guard = Arc::new(Mutex::new(guard));
+            vmm.exit_observers.push(Arc::new(Mutex::new(move || {
+                if let Err(e) = guard.lock().unwrap().release() {
+                    log::error!("Failed to restore terminal output code page: {e}");
+                }
+            })))
+        }
+        Err(e) => log::error!("Failed to set terminal output code page to UTF-8: {e}"),
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn setup_terminal_raw_mode(
     vmm: &mut Vmm,
     term_handle: Option<BorrowedHandle<'_>>,
     handle_signals_by_terminal: bool,
+    enable_vt_translation: bool,
 ) {
     if let Some(term_handle) = term_handle {
-        match term_set_raw_mode(term_handle, handle_signals_by_terminal) {
+        match term_set_raw_mode(
+            term_handle,
+            handle_signals_by_terminal,
+            enable_vt_translation,
+        ) {
             Ok(old_mode) => {
                 if let Ok(owned_handle) = term_handle.try_clone_to_owned() {
                     vmm.exit_observers.push(Arc::new(Mutex::new(move || {
@@ -2674,9 +2903,98 @@ pub mod tests {
             None,
             false,
             &Payload::Empty,
+            #[cfg(target_os = "macos")]
+            false,
+            #[cfg(target_os = "linux")]
+            false,
             #[cfg(feature = "tee")]
             None,
         )
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    fn test_create_guest_memory_advises_huge_pages_only_when_asked() {
+        for thp in [true, false] {
+            let (guest_memory, _info, _shm_manager, _payload_config) =
+                create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, thp)
+                    .unwrap();
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            for region in guest_memory.iter() {
+                let addr = region.as_ptr() as usize;
+                let flags = vma_flags(&smaps, addr).unwrap();
+                assert_eq!(
+                    flags.split_whitespace().any(|flag| flag == "hg"),
+                    thp,
+                    "{thp}, {addr:x}"
+                );
+            }
+        }
+    }
+
+    // Returns the VmFlags of the mapping that contains addr. The kernel
+    // merges adjacent mappings that have the same flags, so the guest memory
+    // can be part of a larger mapping that starts before it.
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    fn vma_flags(smaps: &str, addr: usize) -> Option<&str> {
+        let mut inside = false;
+        for line in smaps.lines() {
+            let range = line
+                .split_whitespace()
+                .next()
+                .and_then(|r| r.split_once('-'));
+            if let Some((Ok(start), Ok(end))) =
+                range.map(|(s, e)| (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16)))
+            {
+                inside = (start..end).contains(&addr);
+            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return Some(flags);
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_create_guest_memory_maps_ram_in_blocks_only_when_asked() {
+        const MIB: u64 = 1 << 20;
+        for (ram_in_blocks, entry_size) in [(true, RECLAIM_BLOCK_SIZE), (false, 64 * MIB)] {
+            let (guest_memory, info, _shm_manager, payload_config) = create_guest_memory(
+                64,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                &Payload::Empty,
+                ram_in_blocks,
+            )
+            .unwrap();
+            assert_eq!(payload_config.ram_in_blocks, ram_in_blocks);
+            assert_eq!(info.ram_last_addr - info.ram_start_addr, 64 * MIB);
+            for addr in [info.ram_start_addr, info.ram_last_addr - 1] {
+                let host_addr = guest_memory.get_host_address(GuestAddress(addr)).unwrap();
+                let entry = crate::vmm::macos::vm_map::entry(host_addr as u64);
+                assert_eq!(entry.size, entry_size, "{ram_in_blocks}, guest {addr:#x}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_ram_that_cant_be_mapped_in_blocks_is_reported() {
+        let (guest_memory, info, _shm_manager, _payload_config) =
+            create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, false).unwrap();
+
+        let mut asked = None;
+        let in_blocks = map_ram_in_blocks(&guest_memory, &info, |_, ram| {
+            asked = Some(ram);
+            Err(io::Error::from_raw_os_error(libc::ENOMEM))
+        });
+        assert!(!in_blocks);
+        assert_eq!(asked, Some(info.ram_start_addr..info.ram_last_addr));
+
+        assert!(map_ram_in_blocks(&guest_memory, &info, |_, _| Ok(())));
     }
 
     #[test]
@@ -2689,6 +3007,7 @@ pub mod tests {
             ht_enabled: false,
             cpu_template: None,
             nested_enabled: false,
+            invariant_tsc: false,
         };
 
         let (guest_memory, mut arch_memory_info, _shm_manager, _payload_config) =
@@ -2764,6 +3083,7 @@ pub mod tests {
             ht_enabled: false,
             cpu_template: None,
             nested_enabled: false,
+            invariant_tsc: false,
         };
 
         // Dummy entry_addr, vcpus will not boot.

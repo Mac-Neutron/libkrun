@@ -101,9 +101,10 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn new(vcpu_count: u8) -> Result<Self> {
+    pub fn new(vcpu_count: u8, invariant_tsc: bool) -> Result<Self> {
         whp::check_hypervisor().map_err(Error::WhpNotAvailable)?;
-        let whp_vm = Arc::new(WhpVm::new(vcpu_count as u32).map_err(Error::VmSetup)?);
+        let whp_vm =
+            Arc::new(WhpVm::new(vcpu_count as u32, invariant_tsc).map_err(Error::VmSetup)?);
         Ok(Vm { whp_vm })
     }
 
@@ -577,6 +578,10 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// The guest asked for a reset. On Windows a reset reaches the VMM
+    /// through the i8042 eventfd, so no vCPU sends this.
+    #[allow(dead_code)]
+    Reset,
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.

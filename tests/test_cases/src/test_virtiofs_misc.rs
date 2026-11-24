@@ -13,19 +13,11 @@ mod host {
     use super::*;
 
     use crate::common::setup_and_run_with_env;
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
+    use crate::{Test, TestOutcome, TestSetup};
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
 
     impl Test for TestVirtioFsMisc {
-        fn should_run(&self) -> ShouldRun {
-            #[cfg(feature = "dynamic-linking")]
-            if crate::common::require_vm_symbols().is_err() {
-                return ShouldRun::No("core VM symbols not available");
-            }
-            ShouldRun::Yes
-        }
-
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             // Create a host-owned file in the rootfs before entering the VM.
             let root_dir = test_setup.tmp_dir.join("rootfs");
@@ -90,6 +82,10 @@ mod host {
             assert!(path.is_file(), "host: {} missing", path.display());
 
             TestOutcome::Pass
+        }
+
+        fn timeout_secs(&self) -> u64 {
+            30
         }
     }
 }
@@ -730,6 +726,78 @@ mod guest {
         }
     }
 
+    /// A directory larger than many READDIRPLUS replies lists every name once, with the
+    /// attributes the host has, and removes cleanly.
+    fn test_readdirplus_large_directory() {
+        let dir = "/test_readdirplus_large_directory";
+        fs::create_dir(dir).expect("mkdir");
+        let names: HashSet<String> = (0..3000)
+            .map(|i| format!("entry-with-a-long-name-to-fill-the-reply-buffer-{i:05}"))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            fs::write(format!("{dir}/{name}"), vec![b'x'; i % 100]).expect("write entry");
+        }
+
+        let mut seen = HashSet::new();
+        for entry in fs::read_dir(dir).expect("read_dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name().into_string().expect("utf-8 name");
+            let len = entry.metadata().expect("metadata").len();
+            let on_disk = fs::metadata(format!("{dir}/{name}")).expect("stat").len();
+            assert_eq!(len, on_disk, "{name}: size from the listing");
+            assert!(seen.insert(name.clone()), "{name} listed twice");
+        }
+        assert_eq!(seen, names, "the listing holds exactly the names created");
+
+        fs::remove_dir_all(dir).expect("remove_dir_all");
+        assert!(fs::metadata(dir).is_err(), "directory removed");
+    }
+
+    /// The entry's name, after a stat of it, which keeps the kernel on READDIRPLUS.
+    fn listed_name(entry: fs::DirEntry) -> String {
+        let _ = entry.metadata();
+        entry.file_name().into_string().unwrap()
+    }
+
+    /// A name removed while the guest is part-way through a listing does not end the listing:
+    /// every other name still appears.
+    fn test_readdirplus_name_removed_mid_listing() {
+        let dir = "/test_readdirplus_name_removed_mid_listing";
+        fs::create_dir(dir).expect("mkdir");
+        let names: HashSet<String> = (0..3000)
+            .map(|i| format!("entry-with-a-long-name-to-fill-the-reply-buffer-{i:05}"))
+            .collect();
+        for name in &names {
+            fs::write(format!("{dir}/{name}"), b"").expect("write entry");
+        }
+
+        let mut listing = fs::read_dir(dir).expect("read_dir");
+        let mut seen = HashSet::new();
+        for entry in listing.by_ref().take(100) {
+            seen.insert(listed_name(entry.expect("dir entry")));
+        }
+        let removed = names
+            .iter()
+            .find(|name| !seen.contains(*name))
+            .expect("a name not listed yet")
+            .clone();
+        fs::remove_file(format!("{dir}/{removed}")).expect("unlink mid-listing");
+        for entry in listing {
+            seen.insert(listed_name(entry.expect("dir entry")));
+        }
+        seen.remove(&removed);
+
+        let expected: HashSet<String> = names.iter().filter(|n| **n != removed).cloned().collect();
+        assert_eq!(
+            seen.len(),
+            expected.len(),
+            "the listing ended early instead of passing over the removed name"
+        );
+        assert_eq!(seen, expected);
+
+        fs::remove_dir_all(dir).expect("remove_dir_all");
+    }
+
     /// File names are arbitrary bytes on Linux; the server must serve them
     /// without assuming UTF-8. The `lookup` debug log used to format the
     /// name with `to_str().unwrap()`, which panicked the fs worker thread on
@@ -766,6 +834,67 @@ mod guest {
         fs::metadata(sub.join("inner")).expect("stat inside non-UTF-8 dir");
     }
 
+    fn open_read_only(path: &str) -> fs::File {
+        fs::File::open(path).expect("open read-only")
+    }
+
+    /// Drops the guest page cache of the file first, so the read reaches the server.
+    fn read_at(file: &mut fs::File, offset: usize, len: usize) -> Vec<u8> {
+        // SAFETY: the descriptor belongs to `file`, and posix_fadvise touches no memory.
+        let ret = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(ret, 0, "posix_fadvise(DONTNEED)");
+        let mut buf = vec![0; len];
+        file.seek(SeekFrom::Start(offset as u64)).expect("seek");
+        file.read_exact(&mut buf).expect("read");
+        buf
+    }
+
+    /// Many read-only handles of one file each read at their own offset, the last one keeps
+    /// reading after the others close, and they see what a writable handle writes.
+    fn test_read_only_handles_of_one_file() {
+        let path = "/test_read_only_handles_of_one_file";
+        let contents: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        fs::write(path, &contents).expect("write file");
+
+        let mut handles: Vec<fs::File> = (0..64).map(|_| open_read_only(path)).collect();
+        for (i, handle) in handles.iter_mut().enumerate() {
+            let offset = i * 1000;
+            assert_eq!(
+                read_at(handle, offset, 100),
+                contents[offset..offset + 100],
+                "handle {i} at offset {offset}"
+            );
+        }
+
+        let mut last = handles.pop().unwrap();
+        drop(handles);
+        assert_eq!(
+            read_at(&mut last, 4096, 4096),
+            contents[4096..8192],
+            "the last handle after the others closed"
+        );
+
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for writing");
+        writer.write_all(b"rewritten").expect("write");
+        drop(writer);
+        assert_eq!(
+            read_at(&mut last, 0, 9),
+            b"rewritten",
+            "a write seen by an open reader"
+        );
+        drop(last);
+
+        assert_eq!(
+            read_at(&mut open_read_only(path), 0, 9),
+            b"rewritten",
+            "a reader opened after every handle closed"
+        );
+        fs::remove_file(path).expect("remove file");
+    }
+
     impl Test for TestVirtioFsMisc {
         fn in_guest(self: Box<Self>) {
             run_subtests(&[
@@ -797,6 +926,18 @@ mod guest {
                 ),
                 ("uid_gid_mapping_chown", test_uid_gid_mapping_chown),
                 ("non_utf8_file_names", test_non_utf8_file_names),
+                (
+                    "readdirplus_large_directory",
+                    test_readdirplus_large_directory,
+                ),
+                (
+                    "readdirplus_name_removed_mid_listing",
+                    test_readdirplus_name_removed_mid_listing,
+                ),
+                (
+                    "read_only_handles_of_one_file",
+                    test_read_only_handles_of_one_file,
+                ),
             ]);
         }
     }

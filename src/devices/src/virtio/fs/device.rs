@@ -22,9 +22,11 @@ use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
-use super::{defs, defs::uapi};
+use super::{CachePolicy, PermissionSemantics, defs, defs::uapi};
 use crate::virtio::InterruptTransport;
-use crate::virtio::passthrough::PermissionSemantics;
+
+// The passthrough backends' default attribute timeout.
+const DEFAULT_ATTR_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
@@ -50,6 +52,8 @@ pub struct Fs {
     device_state: DeviceState,
     config: VirtioFsConfig,
     allow_idmap: bool,
+    // Attribute timeout restored when switching back to LinuxComplete.
+    cached_attr_timeout: Duration,
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
@@ -77,31 +81,20 @@ impl Fs {
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
-        // The value defined as default in virtio-fs, for a simplified share too: its uid/gid are the asking process's,
-        // which MacNeutron's guest makes one user (mn), and uncached each stat and each read's size check were a round
-        // trip to the host.
-        let attr_timeout = Duration::from_secs(5);
-
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
-            semantics,
-            attr_timeout,
-            // A read-only share serves no extended attributes: the first getxattr or listxattr answers ENOSYS, which
-            // the guest's FUSE keeps, so later ones fail EOPNOTSUPP without a round trip to the host. Nor does a
-            // simplified one, whose host files must gain none (LinuxSimplified: "Extended attributes are not
-            // supported").
-            xattr: !read_only && matches!(semantics, PermissionSemantics::LinuxComplete),
             ..Default::default()
         });
 
         let allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
 
-        Ok(Fs {
+        let mut fs = Fs {
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
             config,
             allow_idmap,
+            cached_attr_timeout: DEFAULT_ATTR_TIMEOUT,
             shm_region: None,
             passthrough_cfg: fs_cfg,
             read_only,
@@ -111,7 +104,11 @@ impl Fs {
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
-        })
+        };
+        if !fs.set_permission_semantics(semantics) && fs.passthrough_cfg.is_some() {
+            return Err(FsError::UnsupportedPermissionSemantics);
+        }
+        Ok(fs)
     }
 
     pub fn id(&self) -> &str {
@@ -120,6 +117,93 @@ impl Fs {
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
         self.shm_region = Some(shm_region);
+    }
+
+    pub fn set_permission_semantics(&mut self, semantics: PermissionSemantics) -> bool {
+        if cfg!(target_os = "linux") && matches!(semantics, PermissionSemantics::LinuxSimplified) {
+            return false;
+        }
+        if cfg!(not(target_os = "macos"))
+            && matches!(semantics, PermissionSemantics::LinuxSimplifiedFixedOwner)
+        {
+            return false;
+        }
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            return false;
+        };
+        let complete = matches!(semantics, PermissionSemantics::LinuxComplete);
+        cfg.semantics = semantics;
+        // Requester ownership is context-dependent, so attributes cannot be cached.
+        cfg.attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
+            Duration::ZERO
+        } else {
+            self.cached_attr_timeout
+        };
+        // A read-only share serves no extended attributes: the first getxattr or listxattr answers ENOSYS, which
+        // the guest's FUSE keeps, so later ones fail EOPNOTSUPP without a round trip to the host (MacNeutron).
+        cfg.xattr = !self.read_only && complete;
+        #[cfg(target_os = "macos")]
+        {
+            cfg.fixed_owner = None;
+        }
+        self.allow_idmap = complete;
+        true
+    }
+
+    /// Cache attributes even under `LinuxSimplified` (MacNeutron: one guest user asks these shares).
+    pub fn cache_simplified_attributes(&mut self) {
+        if let Some(cfg) = self.passthrough_cfg.as_mut() {
+            cfg.attr_timeout = self.cached_attr_timeout;
+        }
+    }
+
+    /// Sets the owner that `LinuxSimplifiedFixedOwner` reports; fails in any other mode.
+    pub fn set_fixed_owner(&mut self, uid: u32, gid: u32) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(cfg) = self.passthrough_cfg.as_mut()
+            && matches!(
+                cfg.semantics,
+                PermissionSemantics::LinuxSimplifiedFixedOwner
+            )
+        {
+            cfg.fixed_owner = Some((uid, gid));
+            return true;
+        }
+        let _ = (uid, gid);
+        false
+    }
+
+    /// Whether the device is in `LinuxSimplifiedFixedOwner` mode with no owner set.
+    pub fn lacks_fixed_owner(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(cfg) = self.passthrough_cfg.as_ref() {
+            return matches!(
+                cfg.semantics,
+                PermissionSemantics::LinuxSimplifiedFixedOwner
+            ) && cfg.fixed_owner.is_none();
+        }
+        false
+    }
+
+    pub fn set_cache_policy(&mut self, policy: CachePolicy) -> bool {
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            return false;
+        };
+        cfg.cache_policy = policy;
+        true
+    }
+
+    pub fn set_cache_timeouts(&mut self, entry_timeout: Duration, attr_timeout: Duration) -> bool {
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            return false;
+        };
+        cfg.entry_timeout = entry_timeout;
+        self.cached_attr_timeout = attr_timeout;
+        // Requester ownership is context-dependent, so attributes stay uncached.
+        if !matches!(cfg.semantics, PermissionSemantics::LinuxSimplified) {
+            cfg.attr_timeout = attr_timeout;
+        }
+        true
     }
 
     pub fn set_export_table(&mut self, export_table: ExportTable) -> u64 {
@@ -263,5 +347,306 @@ impl VirtioDevice for Fs {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filesystem(shared_dir: Option<String>) -> Fs {
+        Fs::new(
+            "shared".to_owned(),
+            PermissionSemantics::LinuxComplete,
+            shared_dir,
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn permission_changes_update_ownership_caching_and_idmap_support() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        for semantics in [
+            PermissionSemantics::LinuxSimplified,
+            PermissionSemantics::LinuxComplete,
+        ] {
+            assert!(fs.set_permission_semantics(semantics));
+            let cfg = fs.passthrough_cfg.as_ref().unwrap();
+            if matches!(semantics, PermissionSemantics::LinuxComplete) {
+                assert!(matches!(cfg.semantics, PermissionSemantics::LinuxComplete));
+                assert_eq!(cfg.attr_timeout, Duration::from_secs(5));
+                assert!(cfg.xattr);
+                assert!(fs.allow_idmap);
+            } else {
+                assert!(matches!(
+                    cfg.semantics,
+                    PermissionSemantics::LinuxSimplified
+                ));
+                assert_eq!(cfg.attr_timeout, Duration::ZERO);
+                assert!(!cfg.xattr);
+                assert!(!fs.allow_idmap);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fixed_owner_semantics_keep_attributes_cacheable() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(fs.lacks_fixed_owner());
+        assert!(fs.set_fixed_owner(1234, 5678));
+        assert!(!fs.lacks_fixed_owner());
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert_eq!(cfg.fixed_owner, Some((1234, 5678)));
+        assert_eq!(cfg.attr_timeout, Duration::from_secs(5));
+        assert!(!cfg.xattr);
+        assert!(!fs.allow_idmap);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fixed_owner_is_rejected_in_other_semantics() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        for semantics in [
+            PermissionSemantics::LinuxComplete,
+            PermissionSemantics::LinuxSimplified,
+        ] {
+            assert!(fs.set_permission_semantics(semantics));
+            assert!(!fs.set_fixed_owner(1234, 5678));
+            assert!(!fs.lacks_fixed_owner());
+            assert_eq!(fs.passthrough_cfg.as_ref().unwrap().fixed_owner, None);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn changing_semantics_clears_the_fixed_owner() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(fs.set_fixed_owner(1234, 5678));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplified));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(fs.lacks_fixed_owner());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn fixed_owner_semantics_are_rejected_off_macos() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(!fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert!(!fs.set_fixed_owner(1234, 5678));
+        assert!(!fs.lacks_fixed_owner());
+    }
+
+    #[test]
+    fn null_filesystems_reject_permission_changes() {
+        let mut fs = filesystem(None);
+        assert!(!fs.set_permission_semantics(PermissionSemantics::LinuxSimplified));
+        assert!(fs.allow_idmap);
+        assert!(fs.passthrough_cfg.is_none());
+    }
+
+    #[test]
+    fn cache_policy_changes_preserve_permission_options() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert_eq!(
+            fs.passthrough_cfg.as_ref().unwrap().cache_policy,
+            CachePolicy::Auto
+        );
+        let attr_timeout = Duration::from_millis(123);
+        fs.passthrough_cfg.as_mut().unwrap().attr_timeout = attr_timeout;
+
+        for policy in [CachePolicy::Never, CachePolicy::Always, CachePolicy::Auto] {
+            assert!(fs.set_cache_policy(policy));
+            let cfg = fs.passthrough_cfg.as_ref().unwrap();
+            assert_eq!(cfg.cache_policy, policy);
+            assert!(matches!(cfg.semantics, PermissionSemantics::LinuxComplete));
+            assert_eq!(cfg.attr_timeout, attr_timeout);
+            assert!(cfg.xattr);
+            assert!(fs.allow_idmap);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn permission_changes_preserve_cache_policy() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_cache_policy(CachePolicy::Always));
+
+        for semantics in [
+            PermissionSemantics::LinuxSimplified,
+            PermissionSemantics::LinuxComplete,
+        ] {
+            assert!(fs.set_permission_semantics(semantics));
+            assert_eq!(
+                fs.passthrough_cfg.as_ref().unwrap().cache_policy,
+                CachePolicy::Always
+            );
+        }
+    }
+
+    #[test]
+    fn cache_timeouts_apply_and_survive_permission_changes() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        let entry_timeout = Duration::from_millis(250);
+        let attr_timeout = Duration::ZERO;
+        assert!(fs.set_cache_timeouts(entry_timeout, attr_timeout));
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert_eq!(cfg.entry_timeout, entry_timeout);
+        assert_eq!(cfg.attr_timeout, attr_timeout);
+        assert_eq!(cfg.cache_policy, CachePolicy::Auto);
+
+        assert!(fs.set_cache_policy(CachePolicy::Never));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxComplete));
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert_eq!(cfg.entry_timeout, entry_timeout);
+        assert_eq!(cfg.attr_timeout, attr_timeout);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn simplified_semantics_keep_attributes_uncached() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplified));
+        let attr_timeout = Duration::from_millis(123);
+        assert!(fs.set_cache_timeouts(Duration::from_secs(1), attr_timeout));
+        assert_eq!(
+            fs.passthrough_cfg.as_ref().unwrap().attr_timeout,
+            Duration::ZERO
+        );
+
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxComplete));
+        assert_eq!(
+            fs.passthrough_cfg.as_ref().unwrap().attr_timeout,
+            attr_timeout
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fixed_owner_semantics_use_the_cache_timeouts() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        let attr_timeout = Duration::from_millis(123);
+        assert!(fs.set_cache_timeouts(Duration::from_secs(1), attr_timeout));
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxSimplifiedFixedOwner));
+        assert_eq!(
+            fs.passthrough_cfg.as_ref().unwrap().attr_timeout,
+            attr_timeout
+        );
+    }
+
+    #[test]
+    fn null_filesystems_reject_cache_timeouts() {
+        let mut fs = filesystem(None);
+        assert!(!fs.set_cache_timeouts(Duration::ZERO, Duration::ZERO));
+        assert!(fs.passthrough_cfg.is_none());
+    }
+
+    #[test]
+    fn null_filesystems_reject_cache_policy_changes() {
+        let mut fs = filesystem(None);
+        for policy in [CachePolicy::Never, CachePolicy::Auto, CachePolicy::Always] {
+            assert!(!fs.set_cache_policy(policy));
+        }
+        assert!(fs.allow_idmap);
+        assert!(fs.passthrough_cfg.is_none());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn constructors_apply_the_selected_permission_semantics() {
+        let fs = Fs::new(
+            "shared".to_owned(),
+            PermissionSemantics::LinuxSimplified,
+            Some("/".to_owned()),
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert!(matches!(
+            cfg.semantics,
+            PermissionSemantics::LinuxSimplified
+        ));
+        assert_eq!(cfg.attr_timeout, Duration::ZERO);
+        assert!(!cfg.xattr);
+        assert!(!fs.allow_idmap);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unsupported_permission_changes_preserve_configuration() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        let attr_timeout = Duration::from_millis(123);
+        fs.passthrough_cfg.as_mut().unwrap().attr_timeout = attr_timeout;
+
+        assert!(!fs.set_permission_semantics(PermissionSemantics::LinuxSimplified));
+
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert!(matches!(cfg.semantics, PermissionSemantics::LinuxComplete));
+        assert_eq!(cfg.attr_timeout, attr_timeout);
+        assert!(cfg.xattr);
+        assert!(fs.allow_idmap);
+        assert!(fs.set_permission_semantics(PermissionSemantics::LinuxComplete));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn constructors_reject_unsupported_permission_semantics() {
+        let result = Fs::new(
+            "shared".to_owned(),
+            PermissionSemantics::LinuxSimplified,
+            Some("/".to_owned()),
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(FsError::UnsupportedPermissionSemantics)
+        ));
+    }
+
+    #[test]
+    fn read_only_shares_disable_xattr() {
+        let fs = Fs::new(
+            "ro".to_owned(),
+            PermissionSemantics::LinuxComplete,
+            Some("/".to_owned()),
+            Arc::new(AtomicI32::new(0)),
+            true,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!fs.passthrough_cfg.as_ref().unwrap().xattr);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn cache_simplified_attributes_restores_default_attr_timeout() {
+        let mut fs = Fs::new(
+            "simplified".to_owned(),
+            PermissionSemantics::LinuxSimplified,
+            Some("/".to_owned()),
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.passthrough_cfg.as_ref().unwrap().attr_timeout,
+            Duration::ZERO
+        );
+        fs.cache_simplified_attributes();
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert_eq!(cfg.attr_timeout, Duration::from_secs(5));
+        assert!(!cfg.xattr);
     }
 }

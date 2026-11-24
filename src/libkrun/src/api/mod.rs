@@ -25,6 +25,8 @@ pub use device_builders::BalloonDevice;
 #[cfg(feature = "blk")]
 pub use device_builders::BlockDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use device_builders::CachePolicy;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::FsDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::FsOverlay;
@@ -39,10 +41,14 @@ pub use device_builders::NetFlags;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub use device_builders::PciDeviceManager;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use device_builders::PermissionSemantics;
 #[cfg(not(feature = "tee"))]
 pub use device_builders::RngDevice;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use device_builders::TpmDevice;
+#[cfg(target_os = "linux")]
+pub use device_builders::RtcDevice;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 pub use device_builders::VhostUserDevice;
 pub use device_builders::{
@@ -96,6 +102,10 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::device_builders::BalloonDevice = 14,
     #[cfg(not(feature = "tee"))]
     crate::api::device_builders::RngDevice = 15,
+    #[cfg(target_os = "linux")]
+    crate::api::device_builders::RtcDevice = 27,
+    #[cfg(target_os = "linux")]
+    crate::api::device_builders::AttachDevice for crate::api::device_builders::RtcDevice,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     crate::api::device_builders::AttachDevice for crate::api::device_builders::FsDevice,
     crate::api::device_builders::AttachDevice for crate::api::device_builders::ConsoleDevice,
@@ -130,8 +140,9 @@ ffier::library_definition!("krun", library_tag = 1,
     #[cfg(not(feature = "tee"))]
     crate::api::device_builders::AttachDevice for crate::api::device_builders::RngDevice,
     crate::api::device_builders::AttachDevice for crate::api::device_builders::VsockDevice,
+    trait crate::api::device_builders::AttachDevice = 28,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    crate::api::device_builders::TpmDevice = 27,
+    crate::api::device_builders::TpmDevice = 29,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     crate::api::device_builders::AttachDevice for crate::api::device_builders::TpmDevice,
     trait ffier_builtins::PushStr = 12,
@@ -146,7 +157,11 @@ ffier::library_definition!("krun", library_tag = 1,
     enum devices::virtio::balloon::FreePageReportingMode,
     enum crate::api::logging::LogLevel,
     enum crate::api::logging::LogStyle,
-    fn crate::api::logging::init_log,
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    enum devices::virtio::fs::PermissionSemantics,
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    enum devices::virtio::fs::CachePolicy,
+    fn crate::api::logging::init_log_fn::init_log,
     fn crate::api::vmm_builder::check_nested_virt,
     bitflags crate::api::logging::LogOptions,
     bitflags crate::api::device_builders::TsiFlags,

@@ -6,6 +6,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#ifndef _WIN32
+#include <sys/types.h>
+#else
+#define ssize_t intptr_t
+#endif
 
 typedef void* KrunVmmError;
 typedef void* KrunMmioDeviceManager;
@@ -21,6 +29,7 @@ typedef void* KrunVmm;
 typedef void* KrunVmmHandle;
 typedef void* KrunBalloonDevice;
 typedef void* KrunRngDevice;
+typedef void* KrunRtcDevice;
 typedef void* KrunVsockDevice;
 typedef void* KrunBlockDevice;
 typedef void* KrunNetDevice;
@@ -30,7 +39,7 @@ typedef void* KrunDisplayBackend;
 typedef void* KrunGpuDevice;
 typedef void* KrunInputDevice;
 typedef void* KrunTpmDevice;
-typedef void* KrunAttachDevice; /* KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunTpmDevice */
+typedef void* KrunAttachDevice; /* KrunRtcDevice | KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunTpmDevice */
 typedef void* KrunDeviceManager; /* KrunMmioDeviceManager | KrunPciDeviceManager */
 typedef void* KrunError; /* KrunVmmError | KrunVtableError */
 typedef void* KrunPushStr; /* KrunVtablePushStr */
@@ -38,7 +47,7 @@ typedef void* KrunPushStr; /* KrunVtablePushStr */
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice | KrunTpmDevice */
+typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunRtcDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice | KrunTpmDevice */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -67,22 +76,36 @@ typedef struct {
     ((KrunBytes){ .data = (const uint8_t*)(arr), .len = sizeof(arr) })
 #endif
 
+/* Count virtual method slots in the caller's vtable type, including gaps, excluding drop. */
+#define KRUN_VTABLE_LEN(T) \
+    ((uint16_t)((sizeof(T) - offsetof(T, drop) - sizeof(((T*)0)->drop)) / sizeof(((T*)0)->drop)))
+
+/* Initialize a vtable with its slot count and zeroed reserved fields. */
+#define KRUN_VTABLE(T, ...) \
+    { ._num_slots = KRUN_VTABLE_LEN(T), ._reserved1 = 0, ._reserved2 = 0, __VA_ARGS__ }
+
 /**
- * Stack-allocated temporary handle for passing vtable-based objects.
- * Only valid for the duration of the call — the callee borrows, not owns.
+ * Construct a temporary object for borrowed parameters.
+ *
+ * Valid ONLY for calls that do not take ownership. The caller owns the
+ * handle, so the callee must not retain or destroy it.
+ *
+ * Do NOT pass it to a function that consumes or retains its argument.
+ * Consuming an unowned object aborts at runtime. To transfer ownership,
+ * use krun_vtable_handle_new() instead.
+ *
+ * Both vtable and user_data must remain valid until the call returns.
  */
 typedef struct {
     uint32_t type_tag;
     uint32_t metadata;
     const void *vtable_ptr;
     const void *user_data;
-    uint16_t vtable_size;
 } KrunVtableHandle;
 
-#define KRUN_VTABLE_HANDLE(tag, vtable, self_data) \
+#define KRUN_TEMP_OBJ(tag, vtable, self_data) \
     ((KrunVtableHandle){ .type_tag = (tag), .metadata = 0, \
-      .vtable_ptr = &(vtable), .user_data = (self_data), \
-      .vtable_size = sizeof(vtable) })
+      .vtable_ptr = (vtable), .user_data = (self_data) })
 
 /**
  * Opaque 16-byte handle entry in an object array.
@@ -110,6 +133,20 @@ typedef struct {
     (assert((size_t)(i) < (arr).len), (KrunObject)(void*)&(arr).items[(i)])
 
 #endif /* KRUN_PRIMITIVES_DEFINED */
+
+/**
+ * Allocate a vtable object for parameters that take ownership.
+ *
+ * This is the owned counterpart of KRUN_TEMP_OBJ. The library
+ * allocates the handle so it can free it with the same allocator, so
+ * never allocate the handle yourself.
+ *
+ * The library calls the vtable drop callback when it releases the
+ * object, so release user_data there. Keep vtable and user_data valid
+ * until then.
+ */
+void* krun_vtable_handle_new(uint32_t type_tag, const void* vtable, const void* user_data);
+typedef void* (*krun_vtable_handle_new_fn)(uint32_t type_tag, const void* vtable, const void* user_data);
 
 /* Free an owned string returned by the library */
 void krun_str_free(KrunStr s);
@@ -160,6 +197,22 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_LOG_STYLE_AUTO 0
 #define KRUN_LOG_STYLE_ALWAYS 1
 #define KRUN_LOG_STYLE_NEVER 2
+#if !((defined(KRUN_CFG_FEATURE_TEE) || defined(KRUN_CFG_FEATURE_AWS_NITRO)))
+
+/* PermissionSemantics ----------------------------------------------- */
+
+#define KRUN_PERMISSION_SEMANTICS_LINUX_COMPLETE 0
+#define KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED 1
+#define KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED_FIXED_OWNER 2
+#endif
+#if !((defined(KRUN_CFG_FEATURE_TEE) || defined(KRUN_CFG_FEATURE_AWS_NITRO)))
+
+/* CachePolicy ------------------------------------------------------- */
+
+#define KRUN_CACHE_POLICY_NEVER 0
+#define KRUN_CACHE_POLICY_AUTO 1
+#define KRUN_CACHE_POLICY_ALWAYS 2
+#endif
 
 /* LogOptions -------------------------------------------------------- */
 
@@ -201,6 +254,7 @@ KrunMmioDeviceManager krun_mmio_device_manager_new();
 typedef KrunMmioDeviceManager (*krun_mmio_device_manager_new_fn)();
 void krun_mmio_device_manager_destroy(KrunMmioDeviceManager handle);
 typedef void (*krun_mmio_device_manager_destroy_fn)(KrunMmioDeviceManager handle);
+#if ((defined(__x86_64__) || defined(_M_X64)) && ((defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32)))
 
 /* PciDeviceManager -------------------------------------------------- */
 
@@ -208,6 +262,8 @@ KrunPciDeviceManager krun_pci_device_manager_new();
 typedef KrunPciDeviceManager (*krun_pci_device_manager_new_fn)();
 void krun_pci_device_manager_destroy(KrunPciDeviceManager handle);
 typedef void (*krun_pci_device_manager_destroy_fn)(KrunPciDeviceManager handle);
+#endif
+#if !((defined(KRUN_CFG_FEATURE_TEE) || defined(KRUN_CFG_FEATURE_AWS_NITRO)))
 
 /* FsDevice ---------------------------------------------------------- */
 
@@ -258,8 +314,62 @@ typedef void (*krun_fs_device_set_overlay_fn)(KrunFsDevice handle, KrunFsOverlay
  */
 void krun_fs_device_set_dax_window_size(KrunFsDevice handle, uint64_t bytes);
 typedef void (*krun_fs_device_set_dax_window_size_fn)(KrunFsDevice handle, uint64_t bytes);
+/**
+ * Select the permission semantics before attaching this device.
+ *
+ * Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps
+ * and disables attribute caching because ownership depends on the requester.
+ * `LinuxSimplifiedFixedOwner` also disables xattrs and idmaps, but keeps attribute
+ * caching, and needs an owner from [`set_fixed_owner`](Self::set_fixed_owner).
+ * Selecting `LinuxSimplified` on a Linux host, or `LinuxSimplifiedFixedOwner` on a host
+ * other than macOS, returns `InvalidParam` without changing the device configuration.
+ * Selecting the semantics again clears the fixed owner.
+ * A NullFs device has no host permission semantics and returns `InvalidParam`.
+ */
+KrunResult krun_fs_device_set_permission_semantics(KrunFsDevice handle, uint32_t semantics, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_permission_semantics_fn)(KrunFsDevice handle, uint32_t semantics, KrunError* err_out);
+/**
+ * Set the owner that `LinuxSimplifiedFixedOwner` reports for every file, before attaching
+ * this device.
+ *
+ * The guest sees `uid`:`gid` as the owner of every file, while files are created and
+ * changed on the host as the user running libkrun. Ownership changes from the guest are
+ * not kept. Attaching a device in `LinuxSimplifiedFixedOwner` without an owner fails.
+ *
+ * The guest sees every set-user-ID and set-group-ID file in the directory as owned by `uid`
+ * and `gid`, so with a `uid` of 0 such a file runs as root in the guest. Mount the share
+ * with `nosuid` unless the guest should allow that.
+ *
+ * Returns `InvalidParam` unless the permission semantics are `LinuxSimplifiedFixedOwner`.
+ */
+KrunResult krun_fs_device_set_fixed_owner(KrunFsDevice handle, uint32_t uid, uint32_t gid, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_fixed_owner_fn)(KrunFsDevice handle, uint32_t uid, uint32_t gid, KrunError* err_out);
+/**
+ * Select guest file-data caching before attaching this device.
+ *
+ * Defaults to `Auto`, which uses close-to-open consistency. `Never` forwards file-data
+ * I/O to the server without caching it in the guest. `Always` keeps cached file data
+ * across opens and should only be used when the filesystem has exclusive access to
+ * the shared directory. Attribute caching is controlled by the permission semantics.
+ * A NullFs device has no host-backed file data and returns `InvalidParam`.
+ */
+KrunResult krun_fs_device_set_cache_policy(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_cache_policy_fn)(KrunFsDevice handle, uint32_t policy, KrunError* err_out);
+/**
+ * Set how long the guest may cache lookups and attributes, before attaching this device.
+ *
+ * Both default to 5000 ms. Files changed outside the guest can look stale until the
+ * timeouts expire: a file that grew on the host is read with its old size. Use 0 for
+ * directories the host modifies while the guest uses them, at the cost of one more
+ * request to the server per lookup or attribute read. With `LinuxSimplified`
+ * attributes are never cached, and `attr_timeout_ms` applies again after switching to
+ * another mode. A NullFs device has no host-backed entries and returns `InvalidParam`.
+ */
+KrunResult krun_fs_device_set_cache_timeouts(KrunFsDevice handle, uint32_t entry_timeout_ms, uint32_t attr_timeout_ms, KrunError* err_out);
+typedef KrunResult (*krun_fs_device_set_cache_timeouts_fn)(KrunFsDevice handle, uint32_t entry_timeout_ms, uint32_t attr_timeout_ms, KrunError* err_out);
 void krun_fs_device_destroy(KrunFsDevice handle);
 typedef void (*krun_fs_device_destroy_fn)(KrunFsDevice handle);
+#endif
 
 /* ConsoleDevice ----------------------------------------------------- */
 
@@ -271,6 +381,7 @@ typedef void (*krun_console_device_destroy_fn)(KrunConsoleDevice handle);
 
 /* ConsoleBuilder ---------------------------------------------------- */
 
+#if (defined(__unix__) || defined(__APPLE__))
 /**
  * Add a TTY-backed port to the console.
  *
@@ -289,6 +400,8 @@ typedef void (*krun_console_device_destroy_fn)(KrunConsoleDevice handle);
  */
 KrunResult krun_console_builder_add_tty_port(KrunConsoleBuilder handle, KrunStr name, int tty_fd, uint32_t* result, KrunError* err_out);
 typedef KrunResult (*krun_console_builder_add_tty_port_fn)(KrunConsoleBuilder handle, KrunStr name, int tty_fd, uint32_t* result, KrunError* err_out);
+#endif
+#if (defined(__unix__) || defined(__APPLE__))
 /**
  * Add a port with separate borrowed input and output fds (no terminal
  * properties). The caller retains responsibility for the descriptors.
@@ -296,9 +409,11 @@ typedef KrunResult (*krun_console_builder_add_tty_port_fn)(KrunConsoleBuilder ha
  */
 KrunResult krun_console_builder_add_inout_port(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
 typedef KrunResult (*krun_console_builder_add_inout_port_fn)(KrunConsoleBuilder handle, KrunStr name, int input_fd, int output_fd, uint32_t* result, KrunError* err_out);
+#endif
 /** Build the console device. At least one port must have been added. */
 KrunConsoleDevice krun_console_builder_build(KrunConsoleBuilder handle, KrunError* err_out);
 typedef KrunConsoleDevice (*krun_console_builder_build_fn)(KrunConsoleBuilder handle, KrunError* err_out);
+#if (defined(__unix__) || defined(__APPLE__))
 /**
  * Set up the default console: port 0 (hvc0) plus named redirect ports.
  *
@@ -316,8 +431,22 @@ typedef KrunConsoleDevice (*krun_console_builder_build_fn)(KrunConsoleBuilder ha
  */
 KrunResult krun_console_builder_add_default_console(KrunConsoleBuilder handle, int stdin, int stdout, int stderr, KrunError* err_out);
 typedef KrunResult (*krun_console_builder_add_default_console_fn)(KrunConsoleBuilder handle, int stdin, int stdout, int stderr, KrunError* err_out);
+#endif
+#if defined(_WIN32)
+KrunResult krun_console_builder_add_tty_port(KrunConsoleBuilder handle, KrunStr name, void * tty_fd, uint32_t* result, KrunError* err_out);
+typedef KrunResult (*krun_console_builder_add_tty_port_fn)(KrunConsoleBuilder handle, KrunStr name, void * tty_fd, uint32_t* result, KrunError* err_out);
+#endif
+#if defined(_WIN32)
+KrunResult krun_console_builder_add_inout_port(KrunConsoleBuilder handle, KrunStr name, void * input_fd, void * output_fd, uint32_t* result, KrunError* err_out);
+typedef KrunResult (*krun_console_builder_add_inout_port_fn)(KrunConsoleBuilder handle, KrunStr name, void * input_fd, void * output_fd, uint32_t* result, KrunError* err_out);
+#endif
+#if defined(_WIN32)
+KrunResult krun_console_builder_add_default_console(KrunConsoleBuilder handle, void * stdin, void * stdout, void * stderr, KrunError* err_out);
+typedef KrunResult (*krun_console_builder_add_default_console_fn)(KrunConsoleBuilder handle, void * stdin, void * stdout, void * stderr, KrunError* err_out);
+#endif
 void krun_console_builder_destroy(KrunConsoleBuilder handle);
 typedef void (*krun_console_builder_destroy_fn)(KrunConsoleBuilder handle);
+#if !((defined(KRUN_CFG_FEATURE_TEE) || defined(KRUN_CFG_FEATURE_AWS_NITRO)))
 
 /* FsOverlay --------------------------------------------------------- */
 
@@ -342,6 +471,7 @@ KrunResult krun_fs_overlay_add_file(KrunFsOverlay handle, KrunStr path, KrunByte
 typedef KrunResult (*krun_fs_overlay_add_file_fn)(KrunFsOverlay handle, KrunStr path, KrunBytes data, uint32_t mode, bool one_shot, KrunError* err_out);
 void krun_fs_overlay_destroy(KrunFsOverlay handle);
 typedef void (*krun_fs_overlay_destroy_fn)(KrunFsOverlay handle);
+#endif
 
 /* Payload ----------------------------------------------------------- */
 
@@ -357,10 +487,13 @@ KrunStr krun_payload_cmdline(KrunPayload handle);
 typedef KrunStr (*krun_payload_cmdline_fn)(KrunPayload handle);
 void krun_payload_append_cmdline(KrunPayload handle, KrunStr extra);
 typedef void (*krun_payload_append_cmdline_fn)(KrunPayload handle, KrunStr extra);
+#if defined(KRUN_CFG_FEATURE_AWS_NITRO)
 KrunPayload krun_payload_nitro_enclave(KrunNitroConfig config, KrunError* err_out);
 typedef KrunPayload (*krun_payload_nitro_enclave_fn)(KrunNitroConfig config, KrunError* err_out);
+#endif
 void krun_payload_destroy(KrunPayload handle);
 typedef void (*krun_payload_destroy_fn)(KrunPayload handle);
+#if defined(KRUN_CFG_FEATURE_AWS_NITRO)
 
 /* NitroConfig ------------------------------------------------------- */
 
@@ -386,6 +519,7 @@ void krun_nitro_config_debug(KrunNitroConfig* handle, bool enable);
 typedef void (*krun_nitro_config_debug_fn)(KrunNitroConfig* handle, bool enable);
 void krun_nitro_config_destroy(KrunNitroConfig handle);
 typedef void (*krun_nitro_config_destroy_fn)(KrunNitroConfig handle);
+#endif
 
 /* VmmBuilder -------------------------------------------------------- */
 
@@ -402,10 +536,11 @@ typedef void (*krun_vmm_builder_payload_fn)(KrunVmmBuilder* handle, KrunPayload 
  *
  * PCI devices require ACPI to be enabled with [`VmmBuilder::acpi`].
  */
-void krun_vmm_builder_devices(KrunVmmBuilder* handle, KrunDeviceManager devices);
-typedef void (*krun_vmm_builder_devices_fn)(KrunVmmBuilder* handle, KrunDeviceManager devices);
+void krun_vmm_builder_devices(KrunVmmBuilder* handle, KrunDeviceManager devices /* owned callback; valid until release; Send; trait arguments: 'a */);
+typedef void (*krun_vmm_builder_devices_fn)(KrunVmmBuilder* handle, KrunDeviceManager devices /* owned callback; valid until release; Send; trait arguments: 'a */);
 void krun_vmm_builder_set_kernel_console(KrunVmmBuilder* handle, KrunStr console);
 typedef void (*krun_vmm_builder_set_kernel_console_fn)(KrunVmmBuilder* handle, KrunStr console);
+#if !(defined(_WIN32))
 /**
  * Add a legacy serial console device with the given input and output file descriptors.
  *
@@ -418,10 +553,52 @@ typedef void (*krun_vmm_builder_set_kernel_console_fn)(KrunVmmBuilder* handle, K
  */
 KrunResult krun_vmm_builder_add_serial_console(KrunVmmBuilder* handle, int input_fd, int output_fd, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_add_serial_console_fn)(KrunVmmBuilder* handle, int input_fd, int output_fd, KrunError* err_out);
+#endif
+#if defined(_WIN32)
+/**
+ * Add a legacy serial console device with the given Windows handles.
+ *
+ * Can be called multiple times to add multiple serial consoles (ttyS0, ttyS1, …).
+ * The handles are borrowed, not duplicated. They must remain valid until the VMM exits.
+ */
+KrunResult krun_vmm_builder_add_serial_console(KrunVmmBuilder* handle, void * input_handle, void * output_handle, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_add_serial_console_fn)(KrunVmmBuilder* handle, void * input_handle, void * output_handle, KrunError* err_out);
+#endif
 void krun_vmm_builder_nested_virt(KrunVmmBuilder* handle, bool enabled);
 typedef void (*krun_vmm_builder_nested_virt_fn)(KrunVmmBuilder* handle, bool enabled);
+/**
+ * Exit the process with `code` when the guest resets instead of
+ * powering off.
+ *
+ * By default both end the VMM with exit code 0. With a reset exit code
+ * the caller can tell a reboot from a shutdown and start the VM again.
+ * A guest reset reaches the VMM through PSCI SYSTEM_RESET on aarch64 and
+ * the i8042 reset line on x86_64; an exit code set by the guest init
+ * takes precedence.
+ */
+void krun_vmm_builder_reset_exit_code(KrunVmmBuilder* handle, uint8_t code);
+typedef void (*krun_vmm_builder_reset_exit_code_fn)(KrunVmmBuilder* handle, uint8_t code);
+/**
+ * Expose the host's invariant TSC capability to x86_64 guests.
+ *
+ * Disabled by default so Linux guests can prefer a paravirtual clock.
+ * Enabling this preserves backend support for CPUID.80000007H:EDX[8];
+ * it does not add support when the host lacks it.
+ */
+KrunResult krun_vmm_builder_invariant_tsc(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_invariant_tsc_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 KrunResult krun_vmm_builder_split_irqchip(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 typedef KrunResult (*krun_vmm_builder_split_irqchip_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+/**
+ * Ask for transparent huge pages for guest memory.
+ *
+ * Advises `MADV_HUGEPAGE` on guest memory, so a host with THP set to
+ * `madvise` backs it with huge pages. Building the VM fails if the host
+ * kernel is built without transparent huge page support. Only supported
+ * on Linux.
+ */
+KrunResult krun_vmm_builder_transparent_huge_pages(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_transparent_huge_pages_fn)(KrunVmmBuilder* handle, bool enabled, KrunError* err_out);
 /**
  * Enable ACPI table generation for x86_64 guests.
  *
@@ -464,8 +641,21 @@ typedef void (*krun_vmm_destroy_fn)(KrunVmm handle);
 
 /* VmmHandle --------------------------------------------------------- */
 
+/**
+ * Request a VM pause. Success means the request was queued.
+ * The VMM processes it asynchronously and logs any execution failures.
+ *
+ * Returns [`VmmError::FeatureDisabled`] on Windows, for SEV and TDX guests,
+ * and with a split irqchip.
+ */
 KrunResult krun_vmm_handle_pause(KrunVmmHandle handle, KrunError* err_out);
 typedef KrunResult (*krun_vmm_handle_pause_fn)(KrunVmmHandle handle, KrunError* err_out);
+/**
+ * Request that a paused VM resume. Success means the request was queued.
+ * The VMM processes it asynchronously and logs any execution failures.
+ *
+ * Returns [`VmmError::FeatureDisabled`] where [`VmmHandle::pause`] does.
+ */
 KrunResult krun_vmm_handle_resume(KrunVmmHandle handle, KrunError* err_out);
 typedef KrunResult (*krun_vmm_handle_resume_fn)(KrunVmmHandle handle, KrunError* err_out);
 /**
@@ -481,6 +671,7 @@ KrunResult krun_vmm_handle_shutdown(KrunVmmHandle handle, KrunError* err_out);
 typedef KrunResult (*krun_vmm_handle_shutdown_fn)(KrunVmmHandle handle, KrunError* err_out);
 void krun_vmm_handle_destroy(KrunVmmHandle handle);
 typedef void (*krun_vmm_handle_destroy_fn)(KrunVmmHandle handle);
+#if !(defined(KRUN_CFG_FEATURE_TEE))
 
 /* BalloonDevice ----------------------------------------------------- */
 
@@ -494,13 +685,18 @@ typedef KrunBalloonDevice (*krun_balloon_device_new_fn)(KrunError* err_out);
  * On macOS, madvise() doesn't release guest memory that the guest has written to.
  * [`FreePageReportingMode::Replace`] has the VMM replace the reported pages with fresh
  * memory instead, which does release them. This costs a few system calls per report, and
- * the guest's next access to each page faults it in again. Other platforms don't implement
- * [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
+ * the guest's next access to each page faults it in again. It also has the VMM map guest
+ * RAM in blocks of 2 MiB, one map entry each, and replace whole blocks only. If it can't
+ * map RAM like that, the VM starts anyway and uses [`FreePageReportingMode::Default`].
+ * Other platforms don't implement [`FreePageReportingMode::Replace`], and use
+ * [`FreePageReportingMode::Default`] instead.
  */
 void krun_balloon_device_set_free_page_reporting_mode(KrunBalloonDevice handle, uint32_t mode);
 typedef void (*krun_balloon_device_set_free_page_reporting_mode_fn)(KrunBalloonDevice handle, uint32_t mode);
 void krun_balloon_device_destroy(KrunBalloonDevice handle);
 typedef void (*krun_balloon_device_destroy_fn)(KrunBalloonDevice handle);
+#endif
+#if !(defined(KRUN_CFG_FEATURE_TEE))
 
 /* RngDevice --------------------------------------------------------- */
 
@@ -508,6 +704,16 @@ KrunRngDevice krun_rng_device_new(KrunError* err_out);
 typedef KrunRngDevice (*krun_rng_device_new_fn)(KrunError* err_out);
 void krun_rng_device_destroy(KrunRngDevice handle);
 typedef void (*krun_rng_device_destroy_fn)(KrunRngDevice handle);
+#endif
+#if (defined(__linux__) && !defined(__ANDROID__))
+
+/* RtcDevice --------------------------------------------------------- */
+
+KrunRtcDevice krun_rtc_device_new(KrunError* err_out);
+typedef KrunRtcDevice (*krun_rtc_device_new_fn)(KrunError* err_out);
+void krun_rtc_device_destroy(KrunRtcDevice handle);
+typedef void (*krun_rtc_device_destroy_fn)(KrunRtcDevice handle);
+#endif
 
 /* VsockDevice ------------------------------------------------------- */
 
@@ -533,7 +739,7 @@ typedef void (*krun_vsock_device_destroy_fn)(KrunVsockDevice handle);
  * Create a new block device.
  *
  * Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),
- * and [`SyncMode::Relaxed`].
+ * [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`).
  */
 KrunBlockDevice krun_block_device_new(KrunStr id, KrunStr disk_image_path, uint32_t format, KrunError* err_out);
 typedef KrunBlockDevice (*krun_block_device_new_fn)(KrunStr id, KrunStr disk_image_path, uint32_t format, KrunError* err_out);
@@ -551,6 +757,23 @@ typedef void (*krun_block_device_set_direct_io_fn)(KrunBlockDevice handle, bool 
  */
 void krun_block_device_set_sync_mode(KrunBlockDevice handle, uint32_t sync_mode);
 typedef void (*krun_block_device_set_sync_mode_fn)(KrunBlockDevice handle, uint32_t sync_mode);
+/**
+ * Serve guest reads on a host thread pool with out-of-order completion.
+ *
+ * Disabled by default. Writes, flushes, and discards stay on the device thread.
+ * The pool size is automatic unless overridden with [`set_read_pool_size`](Self::set_read_pool_size).
+ */
+void krun_block_device_set_parallel_reads(KrunBlockDevice handle, bool enabled);
+typedef void (*krun_block_device_set_parallel_reads_fn)(KrunBlockDevice handle, bool enabled);
+/**
+ * Set the requested number of worker threads for parallel reads.
+ *
+ * Only applies when parallel reads are enabled. If the requested size is greater than the
+ * available host parallelism, or it cannot be determined, reads remain serialized. Pass 0
+ * to restore automatic pool sizing.
+ */
+void krun_block_device_set_read_pool_size(KrunBlockDevice handle, size_t size);
+typedef void (*krun_block_device_set_read_pool_size_fn)(KrunBlockDevice handle, size_t size);
 void krun_block_device_destroy(KrunBlockDevice handle);
 typedef void (*krun_block_device_destroy_fn)(KrunBlockDevice handle);
 
@@ -559,6 +782,7 @@ typedef void (*krun_block_device_destroy_fn)(KrunBlockDevice handle);
 /** Create a net device backed by a Unix datagram socket path. */
 KrunNetDevice krun_net_device_new_unixgram_path(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixgram_path_fn)(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
+#if (defined(__unix__) || defined(__APPLE__))
 /**
  * Create a net device backed by a Unix datagram socket fd.
  *
@@ -566,9 +790,11 @@ typedef KrunNetDevice (*krun_net_device_new_unixgram_path_fn)(KrunStr id, KrunSt
  */
 KrunNetDevice krun_net_device_new_unixgram_fd(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixgram_fd_fn)(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
+#endif
 /** Create a net device backed by a Unix stream socket path. */
 KrunNetDevice krun_net_device_new_unixstream_path(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixstream_path_fn)(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
+#if (defined(__unix__) || defined(__APPLE__))
 /**
  * Create a net device backed by a Unix stream socket fd.
  *
@@ -576,6 +802,7 @@ typedef KrunNetDevice (*krun_net_device_new_unixstream_path_fn)(KrunStr id, Krun
  */
 KrunNetDevice krun_net_device_new_unixstream_fd(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixstream_fd_fn)(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
+#endif
 KrunNetDevice krun_net_device_new_tap(KrunStr id, KrunStr tap_name, KrunBytes mac, uint32_t features, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_tap_fn)(KrunStr id, KrunStr tap_name, KrunBytes mac, uint32_t features, KrunError* err_out);
 void krun_net_device_destroy(KrunNetDevice handle);
@@ -593,8 +820,17 @@ void krun_display_info_builder_physical_size(KrunDisplayInfoBuilder* handle, uin
 typedef void (*krun_display_info_builder_physical_size_fn)(KrunDisplayInfoBuilder* handle, uint16_t width_mm, uint16_t height_mm);
 void krun_display_info_builder_refresh_rate(KrunDisplayInfoBuilder* handle, uint32_t rate);
 typedef void (*krun_display_info_builder_refresh_rate_fn)(KrunDisplayInfoBuilder* handle, uint32_t rate);
+/**
+ * Set the PNP manufacturer ID and product name of the generated EDID.
+ *
+ * `manufacturer` must be exactly 3 ASCII uppercase letters and
+ * `display_name` at most 13 bytes, matching the EDID descriptor limits.
+ */
+KrunResult krun_display_info_builder_edid_name(KrunDisplayInfoBuilder* handle, KrunStr manufacturer, KrunStr display_name, KrunError* err_out);
+typedef KrunResult (*krun_display_info_builder_edid_name_fn)(KrunDisplayInfoBuilder* handle, KrunStr manufacturer, KrunStr display_name, KrunError* err_out);
 void krun_display_info_builder_destroy(KrunDisplayInfoBuilder handle);
 typedef void (*krun_display_info_builder_destroy_fn)(KrunDisplayInfoBuilder handle);
+#if (defined(__linux__) && !defined(__ANDROID__))
 
 /* VhostUserDevice --------------------------------------------------- */
 
@@ -617,6 +853,7 @@ void krun_vhost_user_device_set_display_backend(KrunVhostUserDevice handle, Krun
 typedef void (*krun_vhost_user_device_set_display_backend_fn)(KrunVhostUserDevice handle, KrunDisplayBackend backend);
 void krun_vhost_user_device_destroy(KrunVhostUserDevice handle);
 typedef void (*krun_vhost_user_device_destroy_fn)(KrunVhostUserDevice handle);
+#endif
 
 /* DisplayBackend ---------------------------------------------------- */
 
@@ -663,6 +900,7 @@ typedef void (*krun_gpu_device_destroy_fn)(KrunGpuDevice handle);
  */
 KrunInputDevice krun_input_device_new(const void* config_backend, size_t config_backend_size, const void* event_provider_backend, size_t event_provider_backend_size, KrunError* err_out);
 typedef KrunInputDevice (*krun_input_device_new_fn)(const void* config_backend, size_t config_backend_size, const void* event_provider_backend, size_t event_provider_backend_size, KrunError* err_out);
+#if (defined(__linux__) && !defined(__ANDROID__))
 /**
  * Create a passthrough input device from an evdev fd.
  *
@@ -671,8 +909,10 @@ typedef KrunInputDevice (*krun_input_device_new_fn)(const void* config_backend, 
  */
 KrunInputDevice krun_input_device_new_from_fd(int input_fd, KrunError* err_out);
 typedef KrunInputDevice (*krun_input_device_new_from_fd_fn)(int input_fd, KrunError* err_out);
+#endif
 void krun_input_device_destroy(KrunInputDevice handle);
 typedef void (*krun_input_device_destroy_fn)(KrunInputDevice handle);
+#if ((defined(__APPLE__) && TARGET_OS_OSX) && (defined(__aarch64__) || defined(_M_ARM64)))
 
 /* TpmDevice --------------------------------------------------------- */
 
@@ -688,20 +928,30 @@ KrunTpmDevice krun_tpm_device_new(const void* backend, size_t backend_size, Krun
 typedef KrunTpmDevice (*krun_tpm_device_new_fn)(const void* backend, size_t backend_size, KrunError* err_out);
 void krun_tpm_device_destroy(KrunTpmDevice handle);
 typedef void (*krun_tpm_device_destroy_fn)(KrunTpmDevice handle);
+#endif
 
 /* DeviceManager (dispatch) ------------------------------------------ */
 
 /** Add a device to this manager, preserving the order devices are added. */
-void krun_device_manager_add(KrunDeviceManager handle, KrunAttachDevice device);
-typedef void (*krun_device_manager_add_fn)(KrunDeviceManager handle, KrunAttachDevice device);
+void krun_device_manager_add(KrunDeviceManager handle, KrunAttachDevice device /* owned callback; valid until release; Send; trait arguments: 'a */);
+typedef void (*krun_device_manager_add_fn)(KrunDeviceManager handle, KrunAttachDevice device /* owned callback; valid until release; Send; trait arguments: 'a */);
 void krun_device_manager_destroy(KrunDeviceManager handle);
 typedef void (*krun_device_manager_destroy_fn)(KrunDeviceManager handle);
+
+/* AttachDevice (dispatch) ------------------------------------------- */
+
+void krun_attach_device_destroy(KrunAttachDevice handle);
+typedef void (*krun_attach_device_destroy_fn)(KrunAttachDevice handle);
 
 /* KrunPushStrVtable ------------------------------------------------- */
 
 #define KRUN_PUSH_STR_TYPE_TAG 16777228
 
 typedef struct {
+    uint16_t _num_slots; /* number of virtual method slots (excluding drop), including reserved gaps */
+    uint16_t _reserved1; /* must be zero */
+    uint32_t _reserved2; /* must be zero */
+    /* Releases transferred user_data exactly once; never called for borrowed parameters. */
     void (*drop)(void* self_data);
     bool (*push)(void* self_data, KrunStr s);
 } KrunPushStrVtable;
@@ -718,9 +968,13 @@ typedef void (*krun_push_str_destroy_fn)(KrunPushStr handle);
 #define KRUN_ERROR_TYPE_TAG 16777229
 
 typedef struct {
+    uint16_t _num_slots; /* number of virtual method slots (excluding drop), including reserved gaps */
+    uint16_t _reserved1; /* must be zero */
+    uint32_t _reserved2; /* must be zero */
+    /* Releases transferred user_data exactly once; never called for borrowed parameters. */
     void (*drop)(void* self_data);
     uint32_t (*code)(void* self_data);
-    void (*message)(void* self_data, KrunPushStr writer);
+    void (*message)(void* self_data, KrunPushStr writer /* mutable borrowed callback; call-scoped */);
     uint64_t (*result)(void* self_data);
 } KrunErrorVtable;
 
@@ -728,30 +982,63 @@ typedef struct {
 
 uint32_t krun_error_code(KrunError handle);
 typedef uint32_t (*krun_error_code_fn)(KrunError handle);
-void krun_error_message(KrunError handle, KrunPushStr writer);
-typedef void (*krun_error_message_fn)(KrunError handle, KrunPushStr writer);
+void krun_error_message(KrunError handle, KrunPushStr writer /* mutable borrowed callback; call-scoped */);
+typedef void (*krun_error_message_fn)(KrunError handle, KrunPushStr writer /* mutable borrowed callback; call-scoped */);
 uint64_t krun_error_result(KrunError handle);
 typedef uint64_t (*krun_error_result_fn)(KrunError handle);
 void krun_error_destroy(KrunError handle);
 typedef void (*krun_error_destroy_fn)(KrunError handle);
-void krun_mmio_device_manager_add(KrunMmioDeviceManager handle, KrunAttachDevice device);
-typedef void (*krun_mmio_device_manager_add_fn)(KrunMmioDeviceManager handle, KrunAttachDevice device);
-void krun_pci_device_manager_add(KrunPciDeviceManager handle, KrunAttachDevice device);
-typedef void (*krun_pci_device_manager_add_fn)(KrunPciDeviceManager handle, KrunAttachDevice device);
+void krun_mmio_device_manager_add(KrunMmioDeviceManager handle, KrunAttachDevice device /* owned callback; valid until release; Send; trait arguments: 'a */);
+typedef void (*krun_mmio_device_manager_add_fn)(KrunMmioDeviceManager handle, KrunAttachDevice device /* owned callback; valid until release; Send; trait arguments: 'a */);
+#if ((defined(__x86_64__) || defined(_M_X64)) && ((defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32)))
+void krun_pci_device_manager_add(KrunPciDeviceManager handle, KrunAttachDevice device /* owned callback; valid until release; Send; trait arguments: 'a */);
+typedef void (*krun_pci_device_manager_add_fn)(KrunPciDeviceManager handle, KrunAttachDevice device /* owned callback; valid until release; Send; trait arguments: 'a */);
+#endif
+#if (defined(__linux__) && !defined(__ANDROID__))
+#endif
+#if !((defined(KRUN_CFG_FEATURE_TEE) || defined(KRUN_CFG_FEATURE_AWS_NITRO)))
+#endif
+#if (defined(__linux__) && !defined(__ANDROID__))
+#endif
+#if !(defined(KRUN_CFG_FEATURE_TEE))
+#endif
+#if !(defined(KRUN_CFG_FEATURE_TEE))
+#endif
+#if ((defined(__APPLE__) && TARGET_OS_OSX) && (defined(__aarch64__) || defined(_M_ARM64)))
+#endif
 uint32_t krun_vmm_error_code(KrunVmmError handle);
 typedef uint32_t (*krun_vmm_error_code_fn)(KrunVmmError handle);
-void krun_vmm_error_message(KrunVmmError handle, KrunPushStr writer);
-typedef void (*krun_vmm_error_message_fn)(KrunVmmError handle, KrunPushStr writer);
+void krun_vmm_error_message(KrunVmmError handle, KrunPushStr writer /* mutable borrowed callback; call-scoped */);
+typedef void (*krun_vmm_error_message_fn)(KrunVmmError handle, KrunPushStr writer /* mutable borrowed callback; call-scoped */);
 
 /* Free functions ---------------------------------------------------- */
 
+#if (defined(__unix__) || defined(__APPLE__))
 KrunResult krun_init_log(int target, uint32_t level, uint32_t style, uint32_t options, KrunError* err_out);
 typedef KrunResult (*krun_init_log_fn)(int target, uint32_t level, uint32_t style, uint32_t options, KrunError* err_out);
+#endif
+#if defined(_WIN32)
+KrunResult krun_init_log(void * target, uint32_t level, uint32_t style, uint32_t options, KrunError* err_out);
+typedef KrunResult (*krun_init_log_fn)(void * target, uint32_t level, uint32_t style, uint32_t options, KrunError* err_out);
+#endif
 bool krun_check_nested_virt(void);
 typedef bool (*krun_check_nested_virt_fn)(void);
+/* Create an owned fieldless error; returns NULL for payload variants or unknown codes.
+ * Destroy once with error_destroy or transfer ownership to a callback caller. */
+void* krun_error_new(KrunResult r);
+typedef void* (*krun_error_new_fn)(KrunResult r);
+/* Borrow a field by native tuple index. Invalid/opaque indices and undersized buffers abort.
+ * Returned data must not outlive the error handle. */
+void krun_error_payload(const void* handle, size_t index, void* out_buf, size_t buf_size);
+typedef void (*krun_error_payload_fn)(const void* handle, size_t index, void* out_buf, size_t buf_size);
+/* Raw variant name, independent of the static message or native Display. */
 KrunStr krun_result_name(KrunResult r);
 typedef KrunStr (*krun_result_name_fn)(KrunResult r);
 const char* krun_result_name_cstr(KrunResult r);
 typedef const char* (*krun_result_name_cstr_fn)(KrunResult r);
+/* Static message or raw variant name when omitted. No payload or error handle is needed.
+ * Returned strings remain valid while the library is loaded. */
+KrunStr krun_result_message(KrunResult r);
+typedef KrunStr (*krun_result_message_fn)(KrunResult r);
 
 #endif /* LIBKRUN_H */

@@ -277,6 +277,7 @@ impl Proxy for UnixProxy {
         self.push_reset();
         let mut update = self.release();
         self.status = ProxyStatus::Closed;
+        update.polling = Some((self.id, self.as_raw_fd(), EventSet::empty()));
         update.signal_queue = true;
         update
     }
@@ -300,6 +301,10 @@ pub struct UnixAcceptorProxy {
     id: u64,
     fd: OwnedFd,
     peer_port: u32,
+    #[cfg(unix)]
+    path: PathBuf,
+    #[cfg(unix)]
+    identity: (u64, u64),
 }
 
 impl UnixAcceptorProxy {

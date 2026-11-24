@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::IsTerminal;
 use std::marker::PhantomData;
+#[cfg(feature = "blk")]
+use std::num::NonZeroUsize;
 #[cfg(all(feature = "net", not(target_os = "windows")))]
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
@@ -43,7 +45,7 @@ use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use devices::virtio::passthrough::PermissionSemantics;
+pub use devices::virtio::fs::{CachePolicy, PermissionSemantics};
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
 #[cfg(feature = "input")]
 use krun_input;
@@ -55,7 +57,7 @@ use vm_memory::{Address, GuestMemoryBackend};
 use super::error::VmmError;
 use super::export_bitflags;
 
-/// Requirements a device declares before the VM's memory layout is fixed.
+/// Requirements a device declares before the VM's memory and legacy devices are configured.
 /// `#[non_exhaustive]` allows adding new fields in minor releases.
 #[derive(Default)]
 #[non_exhaustive]
@@ -68,6 +70,13 @@ pub struct DeviceRequirements {
     pub gpu_shm: Option<usize>,
     /// Whether this device needs process-shareable memory (vhost-user).
     pub process_shareable_memory: bool,
+    /// Supplies the guest RTC, suppressing any legacy or implicit RTC.
+    pub replaces_legacy_rtc: bool,
+    /// Whether this device replaces ranges of guest RAM with fresh memory to give it back to
+    /// the host. On macOS, that only frees the memory if RAM is mapped in blocks, which the
+    /// VMM then does.
+    #[cfg(target_os = "macos")]
+    pub replaces_guest_ram: bool,
 }
 
 /// Context provided to devices during attachment.
@@ -257,7 +266,7 @@ impl<'a> AttachContext<'a> {
 
     #[cfg(windows)]
     pub fn setup_terminal_raw_mode(&mut self, handle: BorrowedHandle<'_>) {
-        setup_terminal_raw_mode(self.vmm, Some(handle), false);
+        setup_terminal_raw_mode(self.vmm, Some(handle), false, true);
     }
 
     /// Get the macOS memory mapping channel sender, if available.
@@ -267,6 +276,14 @@ impl<'a> AttachContext<'a> {
         &self,
     ) -> Option<crossbeam_channel::Sender<utils::worker_message::WorkerMessage>> {
         self.map_sender.clone()
+    }
+
+    /// Whether the VMM mapped guest RAM in blocks, which it does for a device that declares
+    /// [`DeviceRequirements::replaces_guest_ram`]. It can fail to, in which case the VM still
+    /// starts, and the device must not replace guest RAM.
+    #[cfg(target_os = "macos")]
+    pub fn guest_ram_in_blocks(&self) -> bool {
+        self.vmm.ram_in_blocks
     }
 
     /// Append a string to the kernel command line.
@@ -311,8 +328,10 @@ impl From<ResolvedShmRegion> for VirtioShmRegion {
 /// The [`attach`](AttachDevice::attach) method receives an [`AttachContext`]
 /// with all VMM capabilities. Adding new methods to `AttachContext` is a
 /// non-breaking change, so the trait signature never needs to change.
+#[cfg_attr(feature = "ffi", ffier::export(no_vtable))]
 pub trait AttachDevice<'a>: Send + 'a {
     /// Declare requirements before guest memory is created.
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements::default()
     }
@@ -322,6 +341,7 @@ pub trait AttachDevice<'a>: Send + 'a {
     /// The device should:
     /// 1. Perform any device-specific setup using `ctx` methods
     /// 2. Call [`ctx.register()`](AttachContext::register) to register on the transport bus
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError>;
 }
 
@@ -387,7 +407,7 @@ pub struct PciDeviceManager<'a> {
     devices: Vec<Box<dyn AttachDevice<'a> + 'a>>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export)]
+#[cfg_attr(feature = "ffi", ffier::export(send, invariant('a)))]
 impl<'a> MmioDeviceManager<'a> {
     /// Create an empty device manager.
     pub fn new() -> Self {
@@ -448,6 +468,8 @@ impl sealed::Sealed for MmioDeviceManager<'_> {
 #[cfg_attr(
     feature = "ffi",
     ffier::export(
+        send,
+        invariant('a),
         cfg = "all(target_arch = \"x86_64\", any(target_os = \"linux\", target_os = \"windows\"))"
     )
 )]
@@ -542,7 +564,10 @@ pub struct FsOverlay<'a> {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))")
+    ffier::export(
+        covariant('a),
+        cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+    )
 )]
 #[cfg_attr(
     not(feature = "ffi"),
@@ -632,7 +657,11 @@ pub struct FsDevice<'a> {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))")
+    ffier::export(
+        send,
+        covariant('a),
+        cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+    )
 )]
 #[cfg_attr(
     not(feature = "ffi"),
@@ -659,12 +688,14 @@ impl<'a> FsDevice<'a> {
     /// process asking, permission bits are the host file's own mode, and no extended
     /// attributes are stored, so the host's files keep their owner and gain no xattrs.
     pub fn new_simplified(tag: &str, host_path: &str) -> Result<Self, VmmError> {
-        Self::new_inner(
+        let dev = Self::new_inner(
             tag,
             Some(host_path.to_string()),
             false,
             PermissionSemantics::LinuxSimplified,
-        )
+        )?;
+        dev.inner.lock().unwrap().cache_simplified_attributes();
+        Ok(dev)
     }
 
     /// Create a virtiofs device with no host directory (NullFs).
@@ -691,6 +722,86 @@ impl<'a> FsDevice<'a> {
     /// no DAX window is allocated.
     pub fn set_dax_window_size(&mut self, bytes: u64) {
         self.shm_size = Some(bytes as usize);
+    }
+
+    /// Select the permission semantics before attaching this device.
+    ///
+    /// Defaults to `LinuxComplete`. `LinuxSimplified` disables xattrs and idmaps
+    /// and disables attribute caching because ownership depends on the requester.
+    /// `LinuxSimplifiedFixedOwner` also disables xattrs and idmaps, but keeps attribute
+    /// caching, and needs an owner from [`set_fixed_owner`](Self::set_fixed_owner).
+    /// Selecting `LinuxSimplified` on a Linux host, or `LinuxSimplifiedFixedOwner` on a host
+    /// other than macOS, returns `InvalidParam` without changing the device configuration.
+    /// Selecting the semantics again clears the fixed owner.
+    /// A NullFs device has no host permission semantics and returns `InvalidParam`.
+    pub fn set_permission_semantics(
+        &mut self,
+        semantics: PermissionSemantics,
+    ) -> Result<(), VmmError> {
+        if !self
+            .inner
+            .lock()
+            .unwrap()
+            .set_permission_semantics(semantics)
+        {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
+    }
+
+    /// Set the owner that `LinuxSimplifiedFixedOwner` reports for every file, before attaching
+    /// this device.
+    ///
+    /// The guest sees `uid`:`gid` as the owner of every file, while files are created and
+    /// changed on the host as the user running libkrun. Ownership changes from the guest are
+    /// not kept. Attaching a device in `LinuxSimplifiedFixedOwner` without an owner fails.
+    ///
+    /// The guest sees every set-user-ID and set-group-ID file in the directory as owned by `uid`
+    /// and `gid`, so with a `uid` of 0 such a file runs as root in the guest. Mount the share
+    /// with `nosuid` unless the guest should allow that.
+    ///
+    /// Returns `InvalidParam` unless the permission semantics are `LinuxSimplifiedFixedOwner`.
+    pub fn set_fixed_owner(&mut self, uid: u32, gid: u32) -> Result<(), VmmError> {
+        if !self.inner.lock().unwrap().set_fixed_owner(uid, gid) {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
+    }
+
+    /// Select guest file-data caching before attaching this device.
+    ///
+    /// Defaults to `Auto`, which uses close-to-open consistency. `Never` forwards file-data
+    /// I/O to the server without caching it in the guest. `Always` keeps cached file data
+    /// across opens and should only be used when the filesystem has exclusive access to
+    /// the shared directory. Attribute caching is controlled by the permission semantics.
+    /// A NullFs device has no host-backed file data and returns `InvalidParam`.
+    pub fn set_cache_policy(&mut self, policy: CachePolicy) -> Result<(), VmmError> {
+        if !self.inner.lock().unwrap().set_cache_policy(policy) {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
+    }
+
+    /// Set how long the guest may cache lookups and attributes, before attaching this device.
+    ///
+    /// Both default to 5000 ms. Files changed outside the guest can look stale until the
+    /// timeouts expire: a file that grew on the host is read with its old size. Use 0 for
+    /// directories the host modifies while the guest uses them, at the cost of one more
+    /// request to the server per lookup or attribute read. With `LinuxSimplified`
+    /// attributes are never cached, and `attr_timeout_ms` applies again after switching to
+    /// another mode. A NullFs device has no host-backed entries and returns `InvalidParam`.
+    pub fn set_cache_timeouts(
+        &mut self,
+        entry_timeout_ms: u32,
+        attr_timeout_ms: u32,
+    ) -> Result<(), VmmError> {
+        if !self.inner.lock().unwrap().set_cache_timeouts(
+            std::time::Duration::from_millis(entry_timeout_ms.into()),
+            std::time::Duration::from_millis(attr_timeout_ms.into()),
+        ) {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(())
     }
 }
 
@@ -744,6 +855,9 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         {
             let mut fs = self.inner.lock().unwrap();
+            if fs.lacks_fixed_owner() {
+                return Err(VmmError::InvalidParam());
+            }
             // Wire exit code from VMM into the fs device
             fs.set_exit_code(ctx.exit_code().clone());
             // Resolve overlay entries
@@ -810,7 +924,7 @@ pub struct ConsoleBuilder<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export)]
+#[cfg_attr(feature = "ffi", ffier::export(send, covariant('a)))]
 impl<'a> ConsoleDevice<'a> {
     /// Create a new console builder.
     pub fn builder() -> ConsoleBuilder<'a> {
@@ -822,9 +936,10 @@ impl<'a> ConsoleDevice<'a> {
     }
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "not(target_os = \"windows\")"))]
-#[cfg_attr(not(feature = "ffi"), cfg(not(target_os = "windows")))]
-#[cfg(not(target_os = "windows"))]
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(covariant('a))
+)]
 impl<'a> ConsoleBuilder<'a> {
     /// Add a TTY-backed port to the console.
     ///
@@ -840,6 +955,7 @@ impl<'a> ConsoleBuilder<'a> {
     /// # Returns
     ///
     /// The zero-based port index.
+    #[cfg(unix)]
     pub fn add_tty_port(&mut self, name: &str, tty_fd: BorrowedFd<'a>) -> Result<u32, VmmError> {
         let index = self.ports.len() as u32;
         self.add_tty_port_inner(name, tty_fd)?;
@@ -849,6 +965,7 @@ impl<'a> ConsoleBuilder<'a> {
     /// Add a port with separate borrowed input and output fds (no terminal
     /// properties). The caller retains responsibility for the descriptors.
     /// Pass `None` to disable that direction.
+    #[cfg(unix)]
     pub fn add_inout_port(
         &mut self,
         name: &str,
@@ -906,6 +1023,7 @@ impl<'a> ConsoleBuilder<'a> {
     /// the VMM exits.
     ///
     /// Pass `None` to skip a stream.
+    #[cfg(unix)]
     pub fn add_default_console(
         &mut self,
         stdin: Option<BorrowedFd<'a>>,
@@ -993,12 +1111,8 @@ impl<'a> ConsoleBuilder<'a> {
 
         Ok(())
     }
-}
 
-#[cfg(target_os = "windows")]
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"windows\""))]
-#[cfg_attr(not(feature = "ffi"), cfg(target_os = "windows"))]
-impl<'a> ConsoleBuilder<'a> {
+    #[cfg(windows)]
     pub fn add_tty_port(
         &mut self,
         name: &str,
@@ -1009,6 +1123,7 @@ impl<'a> ConsoleBuilder<'a> {
         Ok(index)
     }
 
+    #[cfg(windows)]
     pub fn add_inout_port(
         &mut self,
         name: &str,
@@ -1041,18 +1156,7 @@ impl<'a> ConsoleBuilder<'a> {
         Ok(index)
     }
 
-    /// Build the console device. At least one port must have been added.
-    pub fn build(self) -> Result<ConsoleDevice<'a>, VmmError> {
-        if self.ports.is_empty() {
-            return Err(VmmError::MissingConfig("no ports added to console".into()));
-        }
-        Ok(ConsoleDevice {
-            ports: self.ports,
-            tty_fds: self.tty_fds,
-            _lifetime: PhantomData,
-        })
-    }
-
+    #[cfg(windows)]
     pub fn add_default_console(
         &mut self,
         stdin: Option<BorrowedHandle<'a>>,
@@ -1302,7 +1406,7 @@ pub struct BalloonDevice {
     pub(crate) inner: Arc<Mutex<devices::virtio::Balloon>>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "not(feature = \"tee\")"))]
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl BalloonDevice {
     pub fn new() -> Result<Self, VmmError> {
@@ -1320,8 +1424,11 @@ impl BalloonDevice {
     /// On macOS, madvise() doesn't release guest memory that the guest has written to.
     /// [`FreePageReportingMode::Replace`] has the VMM replace the reported pages with fresh
     /// memory instead, which does release them. This costs a few system calls per report, and
-    /// the guest's next access to each page faults it in again. Other platforms don't implement
-    /// [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
+    /// the guest's next access to each page faults it in again. It also has the VMM map guest
+    /// RAM in blocks of 2 MiB, one map entry each, and replace whole blocks only. If it can't
+    /// map RAM like that, the VM starts anyway and uses [`FreePageReportingMode::Default`].
+    /// Other platforms don't implement [`FreePageReportingMode::Replace`], and use
+    /// [`FreePageReportingMode::Default`] instead.
     pub fn set_free_page_reporting_mode(&mut self, mode: FreePageReportingMode) {
         #[cfg(target_os = "macos")]
         self.inner
@@ -1337,13 +1444,25 @@ impl BalloonDevice {
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            #[cfg(target_os = "macos")]
+            replaces_guest_ram: self.inner.lock().unwrap().free_page_reporting_mode()
+                == FreePageReportingMode::Replace,
+            ..Default::default()
+        }
+    }
+
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         #[cfg(target_os = "macos")]
-        self.inner
-            .lock()
-            .unwrap()
-            .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
-            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        {
+            let mut balloon = self.inner.lock().unwrap();
+            balloon.set_guest_ram_in_blocks(ctx.guest_ram_in_blocks());
+            balloon
+                .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+                .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        }
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("balloon", self.inner)
     }
@@ -1355,7 +1474,7 @@ pub struct RngDevice {
     pub(crate) inner: Arc<Mutex<devices::virtio::Rng>>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "not(feature = \"tee\")"))]
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl RngDevice {
     pub fn new() -> Result<Self, VmmError> {
@@ -1377,6 +1496,46 @@ impl<'a> AttachDevice<'a> for RngDevice {
     }
 }
 
+/// A virtio RTC providing UTC, TAI and monotonic clocks on Linux hosts.
+///
+/// Adding this device disables the legacy RTC. The guest kernel must have a
+/// virtio-rtc driver. On riscv64, the VMM adds this device automatically when
+/// no RTC device is supplied.
+#[cfg(target_os = "linux")]
+pub struct RtcDevice {
+    inner: Arc<Mutex<devices::virtio::Rtc>>,
+}
+
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "target_os = \"linux\""))]
+#[cfg_attr(not(feature = "ffi"), cfg(target_os = "linux"))]
+impl RtcDevice {
+    pub fn new() -> Result<Self, VmmError> {
+        let rtc =
+            devices::virtio::Rtc::new().map_err(|e| VmmError::Internal(format!("rtc: {e:?}")))?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(rtc)),
+        })
+    }
+}
+
+#[cfg_attr(feature = "ffi", ffier::export(cfg = "target_os = \"linux\""))]
+#[cfg_attr(not(feature = "ffi"), cfg(target_os = "linux"))]
+impl<'a> AttachDevice<'a> for RtcDevice {
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            replaces_legacy_rtc: true,
+            ..Default::default()
+        }
+    }
+
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        ctx.subscribe_events(self.inner.clone())?;
+        ctx.register("rtc", self.inner)
+    }
+}
+
 export_bitflags! {
     bitflags::bitflags! {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1395,7 +1554,7 @@ pub struct VsockDevice {
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export)]
+#[cfg_attr(feature = "ffi", ffier::export(send))]
 impl VsockDevice {
     /// Create a new vsock device.
     ///
@@ -1472,15 +1631,17 @@ pub struct BlockDevice {
     is_read_only: bool,
     direct_io: bool,
     sync_mode: SyncMode,
+    parallel_reads: bool,
+    read_pool_size: Option<NonZeroUsize>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"blk\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "blk"))]
 impl BlockDevice {
     /// Create a new block device.
     ///
     /// Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),
-    /// and [`SyncMode::Relaxed`].
+    /// [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`).
     pub fn new(id: &str, disk_image_path: &str, format: DiskFormat) -> Result<Self, VmmError> {
         Ok(Self {
             id: id.to_string(),
@@ -1489,6 +1650,8 @@ impl BlockDevice {
             is_read_only: false,
             direct_io: false,
             sync_mode: SyncMode::default(),
+            parallel_reads: false,
+            read_pool_size: None,
         })
     }
 
@@ -1509,6 +1672,23 @@ impl BlockDevice {
     pub fn set_sync_mode(&mut self, sync_mode: SyncMode) {
         self.sync_mode = sync_mode;
     }
+
+    /// Serve guest reads on a host thread pool with out-of-order completion.
+    ///
+    /// Disabled by default. Writes, flushes, and discards stay on the device thread.
+    /// The pool size is automatic unless overridden with [`set_read_pool_size`](Self::set_read_pool_size).
+    pub fn set_parallel_reads(&mut self, enabled: bool) {
+        self.parallel_reads = enabled;
+    }
+
+    /// Set the requested number of worker threads for parallel reads.
+    ///
+    /// Only applies when parallel reads are enabled. If the requested size is greater than the
+    /// available host parallelism, or it cannot be determined, reads remain serialized. Pass 0
+    /// to restore automatic pool sizing.
+    pub fn set_read_pool_size(&mut self, size: usize) {
+        self.read_pool_size = NonZeroUsize::new(size);
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1527,6 +1707,8 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.is_read_only,
             self.direct_io,
             self.sync_mode,
+            self.parallel_reads,
+            self.read_pool_size,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 
@@ -1554,7 +1736,7 @@ pub struct NetDevice {
     pub(crate) inner: Arc<Mutex<devices::virtio::Net>>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"net\""))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"net\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "net"))]
 #[cfg(not(target_os = "windows"))]
 impl NetDevice {
@@ -1578,6 +1760,7 @@ impl NetDevice {
     /// Create a net device backed by a Unix datagram socket fd.
     ///
     /// Takes ownership of `fd`; the caller must not close it after this call.
+    #[cfg(unix)]
     pub fn new_unixgram_fd(
         id: &str,
         fd: OwnedFd,
@@ -1616,6 +1799,7 @@ impl NetDevice {
     /// Create a net device backed by a Unix stream socket fd.
     ///
     /// Takes ownership of `fd`; the caller must not close it after this call.
+    #[cfg(unix)]
     pub fn new_unixstream_fd(
         id: &str,
         fd: OwnedFd,
@@ -1633,8 +1817,9 @@ impl NetDevice {
         )
     }
 
-    // FIXME: use #[cfg(target_os = "linux")] on the method once ffier supports
-    // per-method cfg inside #[cfg_attr(feature = "ffi", ffier::export)] impl blocks.
+    // FIXME: use #[cfg(target_os = "linux")] on the method once the TAP test
+    // backend is Linux-gated too; it still calls this on macOS and relies on
+    // the runtime stub below.
     pub fn new_tap(id: &str, tap_name: &str, mac: &[u8], features: u32) -> Result<Self, VmmError> {
         #[cfg(target_os = "linux")]
         {
@@ -1777,6 +1962,26 @@ impl DisplayInfoBuilder {
         }
         self
     }
+
+    /// Set the PNP manufacturer ID and product name of the generated EDID.
+    ///
+    /// `manufacturer` must be exactly 3 ASCII uppercase letters and
+    /// `display_name` at most 13 bytes, matching the EDID descriptor limits.
+    pub fn edid_name(mut self, manufacturer: &str, display_name: &str) -> Result<Self, VmmError> {
+        let DisplayInfoEdid::Generated(params) = &mut self.inner.edid else {
+            return Ok(self);
+        };
+        let mfr = manufacturer.as_bytes();
+        if mfr.len() != 3 || !mfr.iter().all(u8::is_ascii_uppercase) {
+            return Err(VmmError::InvalidParam());
+        }
+        if display_name.is_empty() || display_name.len() > 13 {
+            return Err(VmmError::InvalidParam());
+        }
+        params.manufacturer = [mfr[0], mfr[1], mfr[2]];
+        params.display_name = display_name.to_string();
+        Ok(self)
+    }
 }
 
 /// Wraps the pre-ffier display backend and owns the list of displays.
@@ -1848,7 +2053,7 @@ pub struct GpuDevice {
     shm_size: usize,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
+#[cfg_attr(feature = "ffi", ffier::export(send, cfg = "feature = \"gpu\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "gpu"))]
 impl GpuDevice {
     const DEFAULT_SHM_SIZE: usize = 1 << 33;
@@ -1934,7 +2139,7 @@ pub struct VhostUserDevice {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "all(feature = \"vhost-user\", target_os = \"linux\")")
+    ffier::export(send, cfg = "all(feature = \"vhost-user\", target_os = \"linux\")")
 )]
 #[cfg_attr(
     not(feature = "ffi"),
@@ -2026,7 +2231,10 @@ pub struct InputDevice<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
-#[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"input\""))]
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(send, covariant('a), cfg = "feature = \"input\"")
+)]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "input"))]
 impl<'a> InputDevice<'a> {
     /// Create from opaque config/events backend vtables.
@@ -2171,7 +2379,7 @@ pub struct TpmDevice {
 
 #[cfg_attr(
     feature = "ffi",
-    ffier::export(cfg = "all(target_os = \"macos\", target_arch = \"aarch64\")")
+    ffier::export(send, cfg = "all(target_os = \"macos\", target_arch = \"aarch64\")")
 )]
 #[cfg_attr(
     not(feature = "ffi"),
@@ -2242,4 +2450,21 @@ fn resolve_parent_dirs<'a, 'b>(
         }
     }
     Ok(current)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_balloon_replaces_guest_ram_only_in_the_replace_mode() {
+        let mut balloon = BalloonDevice::new().unwrap();
+        assert!(!balloon.requirements().replaces_guest_ram);
+
+        balloon.set_free_page_reporting_mode(FreePageReportingMode::Replace);
+        assert!(balloon.requirements().replaces_guest_ram);
+
+        balloon.set_free_page_reporting_mode(FreePageReportingMode::Default);
+        assert!(!balloon.requirements().replaces_guest_ram);
+    }
 }

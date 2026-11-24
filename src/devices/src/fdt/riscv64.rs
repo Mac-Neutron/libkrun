@@ -64,6 +64,7 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     device_info: &HashMap<(DeviceType, String), T>,
     aia_device: &IrqChip,
     initrd: &Option<InitrdConfig>,
+    riscv_isa_info: &Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
 ) -> Result<Vec<u8>> {
     // Allocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new()?;
@@ -74,12 +75,13 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
 
     // Header or the root node as per above mentioned documentation.
     let root_node = fdt.begin_node("")?;
-    fdt.property_string("compatible", "linux,dummy-virt")?;
+    fdt.property_string("compatible", "libkrun,riscv64")?;
+    fdt.property_string("model", "libkrun riscv64")?;
     // For info on #address-cells and size-cells resort to Table 3.1 Root Node
     // Properties
     fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
     fdt.property_u32("#size-cells", SIZE_CELLS)?;
-    create_cpu_nodes(&mut fdt, num_vcpu)?;
+    create_cpu_nodes(&mut fdt, num_vcpu, riscv_isa_info)?;
     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_aia_node(&mut fdt, aia_device)?;
@@ -100,7 +102,11 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
 }
 
 // Following are the auxiliary function for creating the different nodes that we append to our FDT.
-fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32) -> Result<()> {
+fn create_cpu_nodes(
+    fdt: &mut FdtWriter,
+    num_cpus: u32,
+    riscv_isa_info: &Option<arch::riscv64::linux::kvm::RiscvIsaInfo>,
+) -> Result<()> {
     // See https://elixir.bootlin.com/linux/v6.10/source/Documentation/devicetree/bindings/riscv/cpus.yaml
     let cpus = fdt.begin_node("cpus")?;
     // As per documentation, on RISC-V 64-bit systems value should be set to 1.
@@ -112,8 +118,60 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, num_cpus: u32) -> Result<()> {
         let cpu = fdt.begin_node(&format!("cpu@{cpu_index:x}"))?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "riscv")?;
-        fdt.property_string("mmu-type", "sv48")?;
-        fdt.property_string("riscv,isa", "rv64imafdc_smaia_ssaia")?;
+        fdt.property_string("mmu-type", "riscv,sv48")?;
+
+        // "riscv,isa" is deprecated by the kernel in favor of the
+        // "riscv,isa-base" + "riscv,isa-extensions" pair; we only emit the
+        // modern properties.
+        //
+        // "riscv,isa-base" identifies the base ISA and is always "rv64i" on
+        // riscv64 (see Documentation/devicetree/bindings/riscv/extensions.yaml).
+        fdt.property_string("riscv,isa-base", "rv64i")?;
+
+        // "riscv,isa-extensions" is a devicetree stringlist: each extension
+        // name must be its own NUL-terminated string. property_string_list()
+        // concatenates each entry with its own trailing NUL. Use the
+        // detected extensions if available, otherwise fall back to
+        // `arch::riscv64::linux::kvm::DEFAULT_ISA_EXTENSIONS` so the CPU
+        // node remains valid and matches the same fallback used by the
+        // detection code itself when it cannot probe anything.
+        let ext_list: Vec<String> = match riscv_isa_info {
+            Some(isa_info) if !isa_info.extensions.is_empty() => {
+                isa_info.extensions.iter().cloned().collect()
+            }
+            _ => arch::riscv64::linux::kvm::DEFAULT_ISA_EXTENSIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+
+        // Only emit a cache block size property alongside the extension it
+        // belongs to: the devicetree bindings document these as dependent
+        // on the matching Z extension being listed in
+        // "riscv,isa-extensions", and the guest kernel sizes real `cbo.*`
+        // cache-maintenance instructions off these values, so they must
+        // not be advertised for an extension we did not detect.
+        let has_ext = |name: &str| ext_list.iter().any(|e| e == name);
+        if let Some(isa_info) = riscv_isa_info {
+            if has_ext("zicbom") {
+                if let Some(size) = isa_info.zicbom_block_size {
+                    fdt.property_u32("riscv,cbom-block-size", size)?;
+                }
+            }
+            if has_ext("zicboz") {
+                if let Some(size) = isa_info.zicboz_block_size {
+                    fdt.property_u32("riscv,cboz-block-size", size)?;
+                }
+            }
+            if has_ext("zicbop") {
+                if let Some(size) = isa_info.zicbop_block_size {
+                    fdt.property_u32("riscv,cbop-block-size", size)?;
+                }
+            }
+        }
+
+        fdt.property_string_list("riscv,isa-extensions", ext_list)?;
+
         fdt.property_string("status", "okay")?;
         fdt.property_u32("reg", cpu_index)?;
         fdt.property_u32("phandle", CPU_BASE_PHANDLE + cpu_index)?;
@@ -177,18 +235,22 @@ fn create_aia_node(fdt: &mut FdtWriter, aia_device: &IrqChip) -> Result<()> {
     // IMSIC
     if aia_device.lock().unwrap().msi_compatible() {
         use arch::riscv64::layout::IMSIC_START;
-        let imsic_name = format!("imsics@{IMSIC_START:x}");
+        let imsic_name = format!("interrupt-controller@{IMSIC_START:x}");
         let imsic_node = fdt.begin_node(&imsic_name)?;
 
-        fdt.property_string(
+        fdt.property_string_list(
             "compatible",
-            aia_device.lock().unwrap().imsic_compatibility(),
+            vec![
+                "qemu,imsics".to_string(),
+                aia_device.lock().unwrap().imsic_compatibility().to_string(),
+            ],
         )?;
         let imsic_reg_prop = aia_device.lock().unwrap().imsic_properties();
         fdt.property_array_u32("reg", &imsic_reg_prop)?;
         fdt.property_u32("#interrupt-cells", 0u32)?;
         fdt.property_null("interrupt-controller")?;
         fdt.property_null("msi-controller")?;
+        fdt.property_u32("#msi-cells", 0u32)?;
         // TODO complete num-ids
         fdt.property_u32("riscv,num-ids", 2047u32)?;
         fdt.property_u32("phandle", AIA_IMSIC_PHANDLE)?;
@@ -206,12 +268,15 @@ fn create_aia_node(fdt: &mut FdtWriter, aia_device: &IrqChip) -> Result<()> {
 
     // APLIC
     use arch::riscv64::layout::APLIC_START;
-    let aplic_name = format!("aplic@{APLIC_START:x}");
+    let aplic_name = format!("interrupt-controller@{APLIC_START:x}");
     let aplic_node = fdt.begin_node(&aplic_name)?;
 
-    fdt.property_string(
+    fdt.property_string_list(
         "compatible",
-        aia_device.lock().unwrap().aplic_compatibility(),
+        vec![
+            "qemu,aplic".to_string(),
+            aia_device.lock().unwrap().aplic_compatibility().to_string(),
+        ],
     )?;
     let reg_cells = aia_device.lock().unwrap().aplic_properties();
     fdt.property_array_u32("reg", &reg_cells)?;

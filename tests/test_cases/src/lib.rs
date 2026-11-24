@@ -11,9 +11,14 @@ extern crate krun_init_cdylib as krun_init;
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
-#[cfg(any(feature = "guest", target_os = "macos"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod test_invariant_tsc;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use test_invariant_tsc::TestInvariantTsc;
+
+#[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
 mod test_vm_pause;
-#[cfg(any(feature = "guest", target_os = "macos"))]
+#[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
 use test_vm_pause::TestVmPause;
 
 mod test_acpi_smp;
@@ -43,6 +48,26 @@ use test_vsock_host_close::TestVsockHostClose;
 mod test_vsock_host_connect_refused;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_vsock_host_connect_refused::TestVsockHostConnectRefused;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_vsock_guest_connect_refused;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_vsock_guest_connect_refused::TestVsockGuestConnectRefused;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_vsock_guest_connect_emfile;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_vsock_guest_connect_emfile::TestVsockGuestConnectEmfile;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_init_control;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_init_control::TestInitControl;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_host_changes;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_host_changes::TestVirtiofsHostChanges;
 
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
@@ -86,10 +111,20 @@ mod test_virtiofs_misc;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_misc::TestVirtioFsMisc;
 
+#[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_fixed_owner;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_fixed_owner::TestVirtiofsFixedOwner;
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod test_virtio_pci;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use test_virtio_pci::TestVirtioPci;
+
+#[cfg(target_os = "linux")]
+mod test_virtio_rtc;
+#[cfg(target_os = "linux")]
+use test_virtio_rtc::TestVirtioRtc;
 
 pub enum TestOutcome {
     Pass,
@@ -127,6 +162,23 @@ impl ShouldRun {
 }
 
 pub fn test_cases() -> Vec<TestCase> {
+    #[cfg(feature = "dynamic-linking")]
+    {
+        use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+        use std::sync::OnceLock;
+
+        static LIBKRUN: OnceLock<Library> = OnceLock::new();
+        LIBKRUN.get_or_init(|| {
+            let name = if cfg!(target_os = "macos") {
+                "libkrun.dylib"
+            } else {
+                "libkrun.so"
+            };
+            unsafe { Library::open(Some(name), RTLD_NOW | RTLD_GLOBAL) }
+                .expect("failed to dlopen libkrun")
+        });
+    }
+
     vec![
         TestCase::new(
             "configure-vm-1cpu-256MiB",
@@ -142,7 +194,26 @@ pub fn test_cases() -> Vec<TestCase> {
                 ram_mib: 1024,
             }),
         ),
-        #[cfg(any(feature = "guest", target_os = "macos"))]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-default",
+            Box::new(TestInvariantTsc { enabled: None }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-disabled",
+            Box::new(TestInvariantTsc {
+                enabled: Some(false),
+            }),
+        ),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        TestCase::new(
+            "cpu-invariant-tsc-enabled",
+            Box::new(TestInvariantTsc {
+                enabled: Some(true),
+            }),
+        ),
+        #[cfg(any(feature = "guest", target_os = "macos", target_os = "linux"))]
         TestCase::new("vm-pause", Box::new(TestVmPause)),
         TestCase::new("acpi-smp-4cpu", Box::new(TestAcpiSmp { num_cpus: 4 })),
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -166,6 +237,18 @@ pub fn test_cases() -> Vec<TestCase> {
             "vsock-host-connect-refused",
             Box::new(TestVsockHostConnectRefused),
         ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "vsock-guest-connect-refused",
+            Box::new(TestVsockGuestConnectRefused),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "vsock-guest-connect-emfile",
+            Box::new(TestVsockGuestConnectEmfile),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("init-control", Box::new(TestInitControl)),
         TestCase::new(
             "tsi-tcp-guest-connect",
             Box::new(TestTsiTcpGuestConnect::new()),
@@ -193,8 +276,16 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-fixed-owner", Box::new(TestVirtiofsFixedOwner)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-host-changes", Box::new(TestVirtiofsHostChanges)),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
+        #[cfg(target_os = "linux")]
+        TestCase::new("rtc-default", Box::new(TestVirtioRtc { enabled: false })),
+        #[cfg(target_os = "linux")]
+        TestCase::new("virtio-rtc", Box::new(TestVirtioRtc { enabled: true })),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
@@ -274,6 +365,9 @@ compile_error!("Cannot enable both guest and host in the same binary!");
 
 #[cfg(feature = "host")]
 mod common;
+
+#[cfg(feature = "host")]
+pub use common::init_krun;
 
 #[cfg(feature = "host")]
 pub mod common_freebsd;

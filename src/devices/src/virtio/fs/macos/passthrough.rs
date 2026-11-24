@@ -13,9 +13,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::ptr::null_mut;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use crossbeam_channel::{Sender, unbounded};
@@ -33,6 +32,7 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
+pub use super::super::{CachePolicy, PermissionSemantics};
 
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
@@ -56,6 +56,9 @@ struct InodeData {
     dev: i32,
     refcount: AtomicU64,
     unlinked_fd: AtomicI64,
+    // Each guest process that maps a file keeps its own handle open, so the read-only handles of
+    // an inode share one host file instead of holding one descriptor each.
+    read_only_file: Mutex<Weak<RwLock<File>>>,
 }
 
 enum InodeHandle {
@@ -153,7 +156,7 @@ impl DirStream {
 
 struct HandleData {
     inode: Inode,
-    file: RwLock<File>,
+    file: Arc<RwLock<File>>,
     dirstream: Mutex<DirStream>,
 }
 
@@ -197,6 +200,22 @@ fn get_xattr_common(buf: &[u8]) -> io::Result<(Option<u32>, Option<u32>, Option<
     Ok((uid, gid, mode))
 }
 
+/// Whether the names `list` returns include `XATTR_KEY`. On APFS, asking for a name a file
+/// doesn't have takes several times longer than listing its names, and most files have no
+/// override, so the owner lookups list the names first. If the list fails or doesn't fit, it
+/// answers yes and the caller asks for the value directly.
+fn has_override_xattr(list: impl FnOnce(*mut libc::c_char, usize) -> isize) -> bool {
+    let mut names = [0u8; 1024];
+    let res = list(names.as_mut_ptr().cast(), names.len());
+    if res < 0 {
+        return true;
+    }
+    let key = &XATTR_KEY[..XATTR_KEY.len() - 1];
+    names[..res as usize]
+        .split(|c| *c == 0)
+        .any(|name| name == key)
+}
+
 fn get_xattr_fstat(
     fd: RawFd,
     st: bindings::stat64,
@@ -207,6 +226,9 @@ fn get_xattr_fstat(
     } else {
         0
     };
+    if !has_override_xattr(|names, len| unsafe { libc::flistxattr(fd, names, len, options) }) {
+        return Ok((None, None, None));
+    }
     let res = unsafe {
         libc::fgetxattr(
             fd,
@@ -237,6 +259,11 @@ fn get_xattr_lstat(
     } else {
         0
     };
+    if !has_override_xattr(|names, len| unsafe {
+        libc::listxattr(path.as_ptr(), names, len, options)
+    }) {
+        return Ok((None, None, None));
+    }
     let res = unsafe {
         libc::getxattr(
             path.as_ptr(),
@@ -277,7 +304,7 @@ fn set_xattr_stat(
     owner: Option<(u32, u32)>,
     mode: Option<u32>,
 ) -> io::Result<()> {
-    let st = st.unwrap_or(istat(ctx, PermissionSemantics::LinuxComplete, file, true)?);
+    let st = st.unwrap_or(istat(ctx, Ownership::Xattr, file, true)?);
     let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
         libc::XATTR_NOFOLLOW
     } else {
@@ -386,8 +413,18 @@ fn set_stat(
 ) -> io::Result<()> {
     match semantics {
         PermissionSemantics::LinuxComplete => set_xattr_stat(ctx, file, st, owner, mode),
-        PermissionSemantics::LinuxSimplified => set_host_stat(file, owner, mode),
+        PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedFixedOwner => {
+            set_host_stat(file, owner, mode)
+        }
     }
+}
+
+/// Where the ownership that the guest sees comes from.
+#[derive(Debug, Clone, Copy)]
+enum Ownership {
+    Xattr,
+    Requester,
+    Fixed(u32, u32),
 }
 
 fn stat_xattr_common(
@@ -415,7 +452,7 @@ fn stat_xattr_common(
 
 fn fstat(
     ctx: &Context,
-    semantics: PermissionSemantics,
+    ownership: Ownership,
     fd: RawFd,
     host: bool,
 ) -> io::Result<bindings::stat64> {
@@ -428,14 +465,19 @@ fn fstat(
         // Safe because the kernel guarantees that the struct is now fully initialized.
         let mut st = unsafe { st.assume_init() };
         if !host {
-            match semantics {
-                PermissionSemantics::LinuxComplete => {
+            match ownership {
+                Ownership::Xattr => {
                     let (uid, gid, mode) = get_xattr_fstat(fd, st)?;
                     stat_xattr_common(&mut st, uid, gid, mode)
                 }
-                PermissionSemantics::LinuxSimplified => {
+                Ownership::Requester => {
                     st.st_uid = ctx.uid;
                     st.st_gid = ctx.gid;
+                    Ok(st)
+                }
+                Ownership::Fixed(uid, gid) => {
+                    st.st_uid = uid;
+                    st.st_gid = gid;
                     Ok(st)
                 }
             }
@@ -449,7 +491,7 @@ fn fstat(
 
 fn lstat(
     ctx: &Context,
-    semantics: PermissionSemantics,
+    ownership: Ownership,
     c_path: &CString,
     host: bool,
 ) -> io::Result<bindings::stat64> {
@@ -462,14 +504,19 @@ fn lstat(
         // Safe because the kernel guarantees that the struct is now fully initialized.
         let mut st = unsafe { st.assume_init() };
         if !host {
-            match semantics {
-                PermissionSemantics::LinuxComplete => {
+            match ownership {
+                Ownership::Xattr => {
                     let (uid, gid, mode) = get_xattr_lstat(c_path, st)?;
                     stat_xattr_common(&mut st, uid, gid, mode)
                 }
-                PermissionSemantics::LinuxSimplified => {
+                Ownership::Requester => {
                     st.st_uid = ctx.uid;
                     st.st_gid = ctx.gid;
+                    Ok(st)
+                }
+                Ownership::Fixed(uid, gid) => {
+                    st.st_uid = uid;
+                    st.st_gid = gid;
                     Ok(st)
                 }
             }
@@ -483,65 +530,14 @@ fn lstat(
 
 fn istat(
     ctx: &Context,
-    semantics: PermissionSemantics,
+    ownership: Ownership,
     ihandle: &InodeHandle,
     host: bool,
 ) -> io::Result<bindings::stat64> {
     match ihandle {
-        InodeHandle::Fd(fd) => fstat(ctx, semantics, *fd, host),
-        InodeHandle::Path(c_path) => lstat(ctx, semantics, c_path, host),
+        InodeHandle::Fd(fd) => fstat(ctx, ownership, *fd, host),
+        InodeHandle::Path(c_path) => lstat(ctx, ownership, c_path, host),
     }
-}
-
-/// The caching policy that the file system should report to the FUSE client. By default the FUSE
-/// protocol uses close-to-open consistency. This means that any cached contents of the file are
-/// invalidated the next time that file is opened.
-#[derive(Debug, Default, Clone)]
-pub enum CachePolicy {
-    /// The client should never cache file data and all I/O should be directly forwarded to the
-    /// server. This policy must be selected when file contents may change without the knowledge of
-    /// the FUSE client (i.e., the file system does not have exclusive access to the directory).
-    Never,
-
-    /// The client is free to choose when and how to cache file data. This is the default policy and
-    /// uses close-to-open consistency as described in the enum documentation.
-    #[default]
-    Auto,
-
-    /// The client should always cache file data. This means that the FUSE client will not
-    /// invalidate any cached data that was returned by the file system the last time the file was
-    /// opened. This policy should only be selected when the file system has exclusive access to the
-    /// directory.
-    Always,
-}
-
-impl FromStr for CachePolicy {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "never" | "Never" | "NEVER" => Ok(CachePolicy::Never),
-            "auto" | "Auto" | "AUTO" => Ok(CachePolicy::Auto),
-            "always" | "Always" | "ALWAYS" => Ok(CachePolicy::Always),
-            _ => Err("invalid cache policy"),
-        }
-    }
-}
-
-/// The permission semantics to be emulated by this file system personality.
-#[derive(Debug, Default, Clone, Copy)]
-pub enum PermissionSemantics {
-    /// Be as close as possible to the common semantics of Linux file systems.
-    #[default]
-    LinuxComplete,
-
-    /// As `LinuxComplete`, with the following simplifications:
-    ///  - Extended attributes are not supported.
-    ///  - Idmaps are not supported.
-    ///  - Ownership bits are ignored, always returning the uid/gid from the process
-    ///    requesting the operation within the guest (obtained from `Context`).
-    ///  - Permissions bits are stored in the host, not as extended attributes.
-    LinuxSimplified,
 }
 
 /// Options that configure the behavior of the file system.
@@ -608,6 +604,21 @@ pub struct Config {
     /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
     /// more details.
     pub semantics: PermissionSemantics,
+
+    /// The owner that `PermissionSemantics::LinuxSimplifiedFixedOwner` reports for every file.
+    pub fixed_owner: Option<(u32, u32)>,
+}
+
+impl Config {
+    fn ownership(&self) -> Ownership {
+        match (self.semantics, self.fixed_owner) {
+            (PermissionSemantics::LinuxComplete, _) => Ownership::Xattr,
+            (PermissionSemantics::LinuxSimplifiedFixedOwner, Some((uid, gid))) => {
+                Ownership::Fixed(uid, gid)
+            }
+            _ => Ownership::Requester,
+        }
+    }
 }
 
 impl Default for Config {
@@ -623,6 +634,7 @@ impl Default for Config {
             export_fsid: 0,
             export_table: None,
             semantics: PermissionSemantics::LinuxComplete,
+            fixed_owner: None,
         }
     }
 }
@@ -849,10 +861,11 @@ impl PassthroughFs {
         inode: Inode,
         kill_priv: bool,
         flags: u32,
+        directory: bool,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
         let flags = self.parse_open_flags(flags as i32);
 
-        let file = RwLock::new(self.open_inode(inode, flags)?);
+        let file = self.open_file(inode, flags, directory)?;
 
         // If O_TRUNC and kill_priv (OPEN_KILL_SUIDGID), clear security.capability and suid/sgid
         if (flags & libc::O_TRUNC) != 0 && kill_priv {
@@ -861,7 +874,7 @@ impl PassthroughFs {
 
             remove_security_capability(&ihandle);
 
-            if let Ok(st) = fstat(ctx, self.cfg.semantics, fd, false) {
+            if let Ok(st) = fstat(ctx, self.cfg.ownership(), fd, false) {
                 let new_mode = clear_suid_sgid(st.st_mode as u32);
                 if new_mode != st.st_mode as u32
                     && let Err(err) = set_stat(
@@ -887,21 +900,43 @@ impl PassthroughFs {
 
         self.handles.write().unwrap().insert(handle, Arc::new(data));
 
-        let mut opts = OpenOptions::empty();
-        match self.cfg.cache_policy {
-            // We only set the direct I/O option on files.
-            CachePolicy::Never => opts.set(OpenOptions::DIRECT_IO, flags & libc::O_DIRECTORY == 0),
-            CachePolicy::Always => {
-                if flags & libc::O_DIRECTORY == 0 {
-                    opts |= OpenOptions::KEEP_CACHE;
-                } else {
-                    opts |= OpenOptions::CACHE_DIR;
-                }
-            }
-            _ => {}
+        let opts = match self.cfg.cache_policy {
+            CachePolicy::Never if !directory => OpenOptions::DIRECT_IO,
+            CachePolicy::Always if directory => OpenOptions::CACHE_DIR,
+            CachePolicy::Always => OpenOptions::KEEP_CACHE,
+            _ => OpenOptions::empty(),
         };
 
         Ok((Some(handle), opts))
+    }
+
+    fn open_file(
+        &self,
+        inode: Inode,
+        flags: i32,
+        directory: bool,
+    ) -> io::Result<Arc<RwLock<File>>> {
+        // A directory handle reads its entries at the descriptor offset, so it cannot share one.
+        let shareable =
+            !directory && flags & libc::O_ACCMODE == libc::O_RDONLY && flags & libc::O_TRUNC == 0;
+        if !shareable {
+            return Ok(Arc::new(RwLock::new(self.open_inode(inode, flags)?)));
+        }
+
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        let mut shared = data.read_only_file.lock().unwrap();
+        if let Some(file) = shared.upgrade() {
+            return Ok(file);
+        }
+        let file = Arc::new(RwLock::new(self.open_inode(inode, flags)?));
+        *shared = Arc::downgrade(&file);
+        Ok(file)
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
@@ -922,8 +957,8 @@ impl PassthroughFs {
     fn do_getattr(&self, ctx: &Context, inode: Inode) -> io::Result<(bindings::stat64, Duration)> {
         let ihandle = self.inode_to_handle(inode, true)?;
         let st = match ihandle {
-            InodeHandle::Path(c_path) => lstat(ctx, self.cfg.semantics, &c_path, false)?,
-            InodeHandle::Fd(fd) => fstat(ctx, self.cfg.semantics, fd, false)?,
+            InodeHandle::Path(c_path) => lstat(ctx, self.cfg.ownership(), &c_path, false)?,
+            InodeHandle::Fd(fd) => fstat(ctx, self.cfg.ownership(), fd, false)?,
         };
 
         Ok((st, self.cfg.attr_timeout))
@@ -944,7 +979,7 @@ impl PassthroughFs {
     }
 
     fn store_unlinked_fd(&self, ctx: &Context, unlinked_fd: RawFd) -> io::Result<bool> {
-        let st = fstat(ctx, self.cfg.semantics, unlinked_fd, true)?;
+        let st = fstat(ctx, self.cfg.ownership(), unlinked_fd, true)?;
         let altkey = InodeAltKey {
             ino: st.st_ino,
             dev: st.st_dev,
@@ -1348,7 +1383,7 @@ impl FileSystem for PassthroughFs {
             gid: 0,
             pid: 0,
         };
-        let st = fstat(&ctx, self.cfg.semantics, f.as_raw_fd(), true)?;
+        let st = fstat(&ctx, self.cfg.ownership(), f.as_raw_fd(), true)?;
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because
@@ -1370,6 +1405,7 @@ impl FileSystem for PassthroughFs {
                 dev: st.st_dev,
                 refcount: AtomicU64::new(2),
                 unlinked_fd: AtomicI64::new(-1),
+                read_only_file: Mutex::new(Weak::new()),
             }),
         );
 
@@ -1383,6 +1419,14 @@ impl FileSystem for PassthroughFs {
             opts |= FsOptions::SUBMOUNTS;
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
+
+        // Every lookup costs a round trip through the VMM, so let the kernel fetch a directory's
+        // attributes along with its entries, and look up names in one directory concurrently.
+        // Neither `readdirplus` nor `lookup` takes a lock on the directory.
+        opts |= capable
+            & (FsOptions::DO_READDIRPLUS
+                | FsOptions::READDIRPLUS_AUTO
+                | FsOptions::PARALLEL_DIROPS);
 
         Ok(opts)
     }
@@ -1419,7 +1463,7 @@ impl FileSystem for PassthroughFs {
             .ok_or_else(ebadf)?;
 
         let c_path = self.name_to_path(parent, name)?;
-        let st = lstat(&ctx, self.cfg.semantics, &c_path, false)?;
+        let st = lstat(&ctx, self.cfg.ownership(), &c_path, false)?;
 
         debug!(
             "lookup: inode={} path={}",
@@ -1463,6 +1507,7 @@ impl FileSystem for PassthroughFs {
                     dev: st.st_dev,
                     refcount: AtomicU64::new(1),
                     unlinked_fd: AtomicI64::new(-1),
+                    read_only_file: Mutex::new(Weak::new()),
                 }),
             );
 
@@ -1499,7 +1544,7 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        self.do_open(&ctx, inode, false, flags | libc::O_DIRECTORY as u32)
+        self.do_open(&ctx, inode, false, flags, true)
     }
 
     fn releasedir(
@@ -1525,7 +1570,8 @@ impl FileSystem for PassthroughFs {
 
         let (host_mode, complete) = match self.cfg.semantics {
             PermissionSemantics::LinuxComplete => (0o700, true),
-            PermissionSemantics::LinuxSimplified => ((mode & !umask) as u16, false),
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedFixedOwner => ((mode & !umask) as u16, false),
         };
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -1585,16 +1631,30 @@ impl FileSystem for PassthroughFs {
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.lookup(ctx, inode, name)?;
-
-            add_entry(dir_entry, entry)
+            // The directory stream keeps each name without a NUL, and without "." and "..".
+            let name = CString::new(dir_entry.name).map_err(|_| einval())?;
+            let entry = match self.lookup(ctx, inode, &name) {
+                Ok(entry) => entry,
+                // A name removed since the directory was read still lists, without attributes,
+                // instead of ending the reply early.
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    return add_entry(dir_entry, Entry::without_attributes());
+                }
+                Err(e) => return Err(e),
+            };
+            let looked_up = entry.inode;
+            match add_entry(dir_entry, entry) {
+                // The entry did not fit, so the kernel never saw the reference this lookup took.
+                Ok(0) => {
+                    forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                    Ok(0)
+                }
+                Err(e) => {
+                    forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                    Err(e)
+                }
+                added => added,
+            }
         })
     }
 
@@ -1605,7 +1665,7 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        self.do_open(&ctx, inode, kill_priv, flags)
+        self.do_open(&ctx, inode, kill_priv, flags, false)
     }
 
     fn release(
@@ -1644,7 +1704,8 @@ impl FileSystem for PassthroughFs {
                 };
                 (mode, true)
             }
-            PermissionSemantics::LinuxSimplified => (mode & !(umask & 0o777), false),
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedFixedOwner => (mode & !(umask & 0o777), false),
         };
 
         // Safe because this doesn't modify any memory and we check the return value. We don't
@@ -1689,7 +1750,7 @@ impl FileSystem for PassthroughFs {
         }
 
         // Safe because we just opened this fd.
-        let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
+        let file = Arc::new(RwLock::new(unsafe { File::from_raw_fd(fd) }));
 
         let entry = self.lookup(ctx, parent, name)?;
 
@@ -1777,7 +1838,7 @@ impl FileSystem for PassthroughFs {
 
             remove_security_capability(&ihandle);
 
-            if let Ok(st) = fstat(&ctx, self.cfg.semantics, fd, false) {
+            if let Ok(st) = fstat(&ctx, self.cfg.ownership(), fd, false) {
                 let new_mode = clear_suid_sgid(st.st_mode as u32);
                 if new_mode != st.st_mode as u32 {
                     // Update mode in xattr
@@ -1858,7 +1919,7 @@ impl FileSystem for PassthroughFs {
             };
 
             remove_security_capability(&ihandle);
-            let st = istat(&ctx, self.cfg.semantics, &ihandle, false)?;
+            let st = istat(&ctx, self.cfg.ownership(), &ihandle, false)?;
 
             // Clear suid/sgid if UID or GID is being changed
             let new_mode = clear_suid_sgid(st.st_mode as u32);
@@ -1888,7 +1949,7 @@ impl FileSystem for PassthroughFs {
 
                     // Clear security.capability on truncate unconditionally
                     remove_security_capability(&ihandle);
-                    let st = fstat(&ctx, self.cfg.semantics, fd, false)?;
+                    let st = fstat(&ctx, self.cfg.ownership(), fd, false)?;
                     let new_mode = clear_suid_sgid(st.st_mode as u32);
                     if new_mode != st.st_mode as u32 {
                         set_stat(
@@ -1915,7 +1976,7 @@ impl FileSystem for PassthroughFs {
                     // reuse the FD we just opened, thus reducing the number of syscalls.
                     let ihandle = InodeHandle::Fd(f.as_raw_fd());
                     remove_security_capability(&ihandle);
-                    let st = istat(&ctx, self.cfg.semantics, &ihandle, false)?;
+                    let st = istat(&ctx, self.cfg.ownership(), &ihandle, false)?;
                     let new_mode = clear_suid_sgid(st.st_mode as u32);
                     if new_mode != st.st_mode as u32 {
                         set_stat(
@@ -2056,7 +2117,8 @@ impl FileSystem for PassthroughFs {
             if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0 {
                 let (host_mode, complete) = match self.cfg.semantics {
                     PermissionSemantics::LinuxComplete => (0o600, true),
-                    PermissionSemantics::LinuxSimplified => {
+                    PermissionSemantics::LinuxSimplified
+                    | PermissionSemantics::LinuxSimplifiedFixedOwner => {
                         (((libc::S_IFCHR | 0o600) as u32), false)
                     }
                 };
@@ -2113,7 +2175,8 @@ impl FileSystem for PassthroughFs {
             PermissionSemantics::LinuxComplete => {
                 self.mknod_complete(ctx, parent, name, mode, rdev, umask, extensions)
             }
-            PermissionSemantics::LinuxSimplified => {
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedFixedOwner => {
                 self.mknod_simplified(ctx, parent, name, mode, rdev, umask, extensions)
             }
         }
@@ -2245,8 +2308,8 @@ impl FileSystem for PassthroughFs {
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
         let st = match self.inode_to_handle(inode, true)? {
-            InodeHandle::Path(c_path) => lstat(&ctx, self.cfg.semantics, &c_path, false)?,
-            InodeHandle::Fd(fd) => fstat(&ctx, self.cfg.semantics, fd, false)?,
+            InodeHandle::Path(c_path) => lstat(&ctx, self.cfg.ownership(), &c_path, false)?,
+            InodeHandle::Fd(fd) => fstat(&ctx, self.cfg.ownership(), fd, false)?,
         };
 
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
@@ -2570,7 +2633,7 @@ impl FileSystem for PassthroughFs {
                 // The best thing we can do here is extend the file to (offset + length).
                 // This doesn't adhere to the same semantics, but should work fine (albeit
                 // less performant) for most guest applications.
-                let st = fstat(&ctx, self.cfg.semantics, fd, true)?;
+                let st = fstat(&ctx, self.cfg.ownership(), fd, true)?;
                 let new_length = (offset + length) as i64;
 
                 if keep_size {
@@ -2794,5 +2857,241 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    const CTX: Context = Context {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+    const LINUX_ARM64_O_DIRECT: i32 = 1 << 16;
+
+    struct Share {
+        dir: PathBuf,
+        fs: PassthroughFs,
+    }
+
+    impl Share {
+        fn with_file(name: &str) -> Self {
+            Self::with_file_and_policy(name, CachePolicy::default())
+        }
+
+        fn with_file_and_policy(name: &str, cache_policy: CachePolicy) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("libkrun-passthrough-{}-{name}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), b"contents").unwrap();
+            let cfg = Config {
+                root_dir: dir.to_str().unwrap().to_string(),
+                cache_policy,
+                ..Default::default()
+            };
+            let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+            fs.init(FsOptions::empty()).unwrap();
+            Share { dir, fs }
+        }
+
+        fn inode(&self, name: &str) -> Inode {
+            let name = CString::new(name).unwrap();
+            self.fs.lookup(CTX, fuse::ROOT_ID, &name).unwrap().inode
+        }
+
+        fn open(&self, inode: Inode, flags: i32) -> Handle {
+            self.fs
+                .open(CTX, inode, false, flags as u32)
+                .unwrap()
+                .0
+                .unwrap()
+        }
+
+        fn fd(&self, handle: Handle) -> RawFd {
+            self.fs.handles.read().unwrap()[&handle]
+                .file
+                .read()
+                .unwrap()
+                .as_raw_fd()
+        }
+    }
+
+    impl Drop for Share {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn read_only_handles_of_one_inode_share_a_host_file() {
+        let share = Share::with_file("shared");
+        let inode = share.inode("shared");
+
+        let first = share.open(inode, libc::O_RDONLY);
+        let second = share.open(inode, libc::O_RDONLY);
+
+        assert_eq!(share.fd(first), share.fd(second));
+    }
+
+    #[test]
+    fn read_only_handles_with_other_flags_share_the_host_file() {
+        let share = Share::with_file("flags");
+        let inode = share.inode("flags");
+
+        let plain = share.open(inode, libc::O_RDONLY);
+        for flags in [
+            bindings::LINUX_O_NONBLOCK,
+            bindings::LINUX_O_SYNC,
+            LINUX_ARM64_O_DIRECT,
+        ] {
+            let handle = share.open(inode, libc::O_RDONLY | flags);
+            assert_eq!(share.fd(plain), share.fd(handle), "flags {flags:#x}");
+        }
+    }
+
+    #[test]
+    fn a_writable_handle_gets_its_own_host_file() {
+        let share = Share::with_file("writable");
+        let inode = share.inode("writable");
+
+        let reader = share.open(inode, libc::O_RDONLY);
+        let writer = share.open(inode, libc::O_RDWR);
+
+        assert_ne!(share.fd(reader), share.fd(writer));
+    }
+
+    #[test]
+    fn directory_handles_keep_their_own_host_file() {
+        let share = Share::with_file("dirs");
+
+        let flags = libc::O_RDONLY as u32;
+        let first = share
+            .fs
+            .opendir(CTX, fuse::ROOT_ID, flags)
+            .unwrap()
+            .0
+            .unwrap();
+        let second = share
+            .fs
+            .opendir(CTX, fuse::ROOT_ID, flags)
+            .unwrap()
+            .0
+            .unwrap();
+
+        assert_ne!(share.fd(first), share.fd(second));
+    }
+
+    #[test]
+    fn cache_policy_applies_file_and_directory_options() {
+        for (name, policy, file_options, directory_options) in [
+            (
+                "uncached",
+                CachePolicy::Never,
+                OpenOptions::DIRECT_IO,
+                OpenOptions::empty(),
+            ),
+            (
+                "cached",
+                CachePolicy::Always,
+                OpenOptions::KEEP_CACHE,
+                OpenOptions::CACHE_DIR,
+            ),
+        ] {
+            let share = Share::with_file_and_policy(name, policy);
+            let inode = share.inode(name);
+            let flags = (libc::O_RDONLY | LINUX_ARM64_O_DIRECT) as u32;
+            let (_, options) = share.fs.open(CTX, inode, false, flags).unwrap();
+            assert_eq!(options, file_options, "{policy:?} file");
+
+            let (_, options) = share
+                .fs
+                .opendir(CTX, fuse::ROOT_ID, libc::O_RDONLY as u32)
+                .unwrap();
+            assert_eq!(options, directory_options, "{policy:?} directory");
+        }
+    }
+
+    #[test]
+    fn the_shared_host_file_closes_with_the_last_handle() {
+        let share = Share::with_file("released");
+        let inode = share.inode("released");
+        let first = share.open(inode, libc::O_RDONLY);
+        let second = share.open(inode, libc::O_RDONLY);
+
+        let shared = Arc::downgrade(&share.fs.handles.read().unwrap()[&first].file);
+
+        share.fs.do_release(inode, first).unwrap();
+        assert!(shared.upgrade().is_some());
+        share.fs.do_release(inode, second).unwrap();
+
+        assert!(shared.upgrade().is_none());
+    }
+
+    fn override_of(path: &CString) -> (Option<u32>, Option<u32>, Option<u32>) {
+        let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+        assert_eq!(unsafe { libc::lstat(path.as_ptr(), st.as_mut_ptr()) }, 0);
+        get_xattr_lstat(path, unsafe { st.assume_init() }).unwrap()
+    }
+
+    #[test]
+    fn test_override_xattr_read_only_when_the_file_has_it() {
+        let path = std::env::temp_dir().join(format!("krun-xattr-{}", std::process::id()));
+        File::create(&path).unwrap();
+        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        let set = |name: &[u8], value: &[u8]| {
+            let res = unsafe {
+                libc::setxattr(
+                    c_path.as_ptr(),
+                    name.as_ptr().cast(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            };
+            assert_eq!(res, 0);
+        };
+
+        assert_eq!(override_of(&c_path), (None, None, None));
+        // Other names alone don't count.
+        set(b"user.other\0", b"1");
+        assert_eq!(override_of(&c_path), (None, None, None));
+        set(XATTR_KEY, b"1000:1001:0644");
+        assert_eq!(override_of(&c_path), (Some(1000), Some(1001), Some(0o644)));
+
+        let fd = File::open(&path).unwrap();
+        let mut st = MaybeUninit::<bindings::stat64>::zeroed();
+        assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) }, 0);
+        let st = unsafe { st.assume_init() };
+        assert_eq!(
+            get_xattr_fstat(fd.as_raw_fd(), st).unwrap(),
+            (Some(1000), Some(1001), Some(0o644))
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_has_override_xattr() {
+        let list = |names: &'static [u8]| {
+            move |buf: *mut libc::c_char, len: usize| {
+                assert!(names.len() <= len);
+                unsafe { std::ptr::copy_nonoverlapping(names.as_ptr(), buf.cast(), names.len()) };
+                names.len() as isize
+            }
+        };
+        assert!(!has_override_xattr(list(b"")));
+        assert!(!has_override_xattr(list(b"com.apple.provenance\0")));
+        assert!(!has_override_xattr(list(
+            b"user.containers.override_stat.x\0"
+        )));
+        assert!(has_override_xattr(list(
+            b"com.apple.provenance\0user.containers.override_stat\0"
+        )));
+        // A list that fails or doesn't fit sends the caller to ask directly.
+        assert!(has_override_xattr(|_, _| -1));
     }
 }
